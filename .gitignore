@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+
+# Exchange (runtime data)
+exchange/request.json
+exchange/request.json.tmp
+exchange/response.json
+exchange/response.json.tmp
+exchange/renders/*.png
+
+# OS
+.DS_Store

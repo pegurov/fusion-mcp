@@ -1,0 +1,12 @@
+{
+    "autodeskProduct": "Fusion",
+    "type": "addin",
+    "id": "f1c2d3e4-a5b6-7890-abcd-ef1234567890",
+    "author": "pegurov",
+    "description": {
+        "": "MCP Bridge — executes Python scripts from Claude and returns viewport renders"
+    },
+    "version": "1.0.0",
+    "runOnStartup": true,
+    "supportedOS": "windows|mac"
+}
