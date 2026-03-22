@@ -22,6 +22,7 @@ Claude Code  ←→  MCP Server (stdio)  ←→  exchange/  ←→  Fusion 360 A
 | `execute_design` | Send Python code to Fusion 360, get output + viewport screenshot |
 | `get_viewport` | Capture current viewport without executing code |
 | `clear_design` | Remove all geometry from the active design |
+| `inspect_design` | Inspect existing model: bodies, sketches, timeline, parameters + screenshot |
 
 The script context has these globals: `app`, `ui`, `design`, `rootComp`, `adsk`.
 
@@ -37,7 +38,7 @@ The script context has these globals: `app`, `ui`, `design`, `rootComp`, `adsk`.
 ### Quick install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/fusion-mcp.git
+git clone https://github.com/pegurov/fusion-mcp.git
 cd fusion-mcp
 ./install.sh
 ```
