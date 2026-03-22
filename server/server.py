@@ -139,6 +139,19 @@ async def list_tools() -> list[Tool]:
                 "properties": {},
             },
         ),
+        Tool(
+            name="inspect_design",
+            description=(
+                "Inspect the current Fusion 360 design and return a detailed report: "
+                "all bodies (with bounding boxes, face/edge counts), sketches, timeline operations, "
+                "user parameters, and component hierarchy. Use this to understand an existing model "
+                "before modifying it. Returns text report + viewport screenshot."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
     ]
 
 
@@ -243,6 +256,114 @@ print(f"Design cleared.")
         if not text.strip():
             text = "Design cleared."
         contents.append(TextContent(type="text", text=text))
+
+        if result.get("render_path"):
+            img_data = _read_image_as_base64(result["render_path"])
+            if img_data:
+                contents.append(
+                    ImageContent(type="image", data=img_data, mimeType="image/png")
+                )
+                try:
+                    os.unlink(result["render_path"])
+                except OSError:
+                    pass
+
+        return contents
+
+    elif name == "inspect_design":
+        inspect_code = '''
+import json as _json
+
+_report = {}
+
+# --- Design info ---
+_report["name"] = design.rootComponent.name
+_report["designType"] = "Parametric" if design.designType == adsk.fusion.DesignTypes.ParametricDesignType else "Direct"
+
+# --- Component hierarchy ---
+def _inspect_component(comp, depth=0):
+    info = {
+        "name": comp.name,
+        "bodies": [],
+        "sketches": [],
+        "sub_components": [],
+    }
+
+    # Bodies
+    for i in range(comp.bRepBodies.count):
+        body = comp.bRepBodies.item(i)
+        bb = body.boundingBox
+        info["bodies"].append({
+            "name": body.name,
+            "visible": body.isVisible,
+            "faces": body.faces.count,
+            "edges": body.edges.count,
+            "vertices": body.vertices.count,
+            "boundingBox": {
+                "min": [round(bb.minPoint.x, 3), round(bb.minPoint.y, 3), round(bb.minPoint.z, 3)],
+                "max": [round(bb.maxPoint.x, 3), round(bb.maxPoint.y, 3), round(bb.maxPoint.z, 3)],
+                "size": [
+                    round(bb.maxPoint.x - bb.minPoint.x, 3),
+                    round(bb.maxPoint.y - bb.minPoint.y, 3),
+                    round(bb.maxPoint.z - bb.minPoint.z, 3),
+                ],
+            },
+        })
+
+    # Sketches
+    for i in range(comp.sketches.count):
+        sk = comp.sketches.item(i)
+        info["sketches"].append({
+            "name": sk.name,
+            "profiles": sk.profiles.count,
+            "curves": sk.sketchCurves.count,
+            "plane": sk.referencePlane.name if hasattr(sk.referencePlane, "name") else str(sk.referencePlane.objectType),
+        })
+
+    # Sub-components
+    for i in range(comp.occurrences.count):
+        occ = comp.occurrences.item(i)
+        info["sub_components"].append(_inspect_component(occ.component, depth + 1))
+
+    return info
+
+_report["rootComponent"] = _inspect_component(rootComp)
+
+# --- Timeline ---
+_timeline_ops = []
+timeline = design.timeline
+for i in range(min(timeline.count, 50)):  # cap at 50
+    item = timeline.item(i)
+    op = {"index": i, "name": item.name}
+    try:
+        entity = item.entity
+        op["type"] = entity.objectType.split("::")[-1]
+    except:
+        op["type"] = "unknown"
+    _timeline_ops.append(op)
+_report["timeline"] = _timeline_ops
+_report["timelineCount"] = timeline.count
+
+# --- User parameters ---
+_params = []
+for i in range(design.userParameters.count):
+    p = design.userParameters.item(i)
+    _params.append({"name": p.name, "value": p.value, "unit": p.unit, "expression": p.expression})
+_report["userParameters"] = _params
+
+# --- Summary ---
+total_bodies = sum(len(c["bodies"]) for c in [_report["rootComponent"]])
+print(_json.dumps(_report, indent=2, ensure_ascii=False))
+'''
+        result = await _send_to_fusion(inspect_code, render=True)
+        contents = []
+
+        if result.get("output"):
+            contents.append(TextContent(type="text", text=result["output"]))
+        if result.get("error"):
+            contents.append(TextContent(type="text", text=f"Error: {result['error']}"))
+        if not contents:
+            contents.append(TextContent(type="text", text="No design data returned."))
 
         if result.get("render_path"):
             img_data = _read_image_as_base64(result["render_path"])
