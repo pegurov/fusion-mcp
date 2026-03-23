@@ -17,6 +17,8 @@ Claude Code  ←→  MCP Server (stdio)  ←→  exchange/  ←→  Fusion 360 A
 
 ## Tools
 
+### Core
+
 | Tool | Description |
 |------|-------------|
 | `execute_design` | Send Python code to Fusion 360, get output + viewport screenshot |
@@ -24,7 +26,35 @@ Claude Code  ←→  MCP Server (stdio)  ←→  exchange/  ←→  Fusion 360 A
 | `clear_design` | Remove all geometry from the active design |
 | `inspect_design` | Inspect existing model: bodies, sketches, timeline, parameters + screenshot |
 
-The script context has these globals: `app`, `ui`, `design`, `rootComp`, `adsk`.
+The `execute_design` script context has these globals: `app`, `ui`, `design`, `rootComp`, `adsk`.
+
+### Convenience
+
+| Tool | Description |
+|------|-------------|
+| `undo` | Undo last N timeline operations, or rollback to a specific timeline index |
+| `export_body` | Export a body as STL (high/medium/low refinement) for 3D printing |
+| `measure` | Measure body dimensions, volume, area. Gap analysis between two bodies |
+| `section_view` | Create a section plane on X/Y/Z axis at a given offset for inspecting internals |
+
+#### Examples
+
+```
+# Undo last 3 operations
+undo(count=3)
+
+# Rollback to timeline index 26 (delete everything after)
+undo(to_index=26)
+
+# Export a body to Desktop as STL
+export_body(body_name="Insert Top", refinement="high")
+
+# Measure gap between frame and insert
+measure(body_name="External Frame", body_name_2="Insert Bottom")
+
+# Section view at Y=0 to see internal holes
+section_view(axis="y", offset=0)
+```
 
 ## Installation
 
