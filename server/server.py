@@ -285,26 +285,31 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="mesh_analyze",
             description=(
-                "Analyze a mesh body (imported STL/OBJ) in Fusion 360 without flooding the context. "
-                "Returns a compact summary: bounding box, triangle/vertex count, volume, surface area, "
-                "and detected features (holes, flat faces, cylindrical regions). "
-                "Use this instead of inspect_design when working with mesh bodies to avoid context overflow."
+                "Analyze a mesh body (STL file or Fusion mesh) without flooding the context. "
+                "Returns: bounding box, triangle/vertex count, detected features (holes, circular openings), "
+                "and surface segmentation by normal direction. "
+                "Prefer stl_path for direct STL analysis (faster, no Fusion needed). "
+                "Use body_name only when the mesh is already loaded in Fusion and not saved as STL."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
+                    "stl_path": {
+                        "type": "string",
+                        "description": "Path to STL file. If provided, analysis runs in pure Python (fast, no Fusion needed).",
+                    },
                     "body_name": {
                         "type": "string",
-                        "description": "Name of the mesh body to analyze. If omitted, analyzes all mesh bodies.",
+                        "description": "Name of mesh body in Fusion. Used only if stl_path is not provided.",
                     },
                     "detect_features": {
                         "type": "boolean",
-                        "description": "Run feature detection (holes, cylinders, flats). Slower but more useful. Default true.",
+                        "description": "Run feature detection (holes, cylinders, flats). Default true.",
                         "default": True,
                     },
                     "sample_size": {
                         "type": "integer",
-                        "description": "Max triangles to sample for feature detection. Default 5000. Higher = more accurate but slower.",
+                        "description": "Max triangles to sample for surface segmentation. Default 5000.",
                         "default": 5000,
                     },
                     "min_radius": {
@@ -1006,587 +1011,26 @@ else:
         return contents
 
     elif name == "mesh_analyze":
+        stl_path = arguments.get("stl_path", "")
         body_name = arguments.get("body_name", "")
         detect_features = arguments.get("detect_features", True)
         sample_size = arguments.get("sample_size", 5000)
         min_radius = arguments.get("min_radius", 5)
         min_circularity = arguments.get("min_circularity", 0.5)
 
-        analyze_code = f'''
-import json as _json
-import math as _math
-
-_body_name = "{body_name}"
-_detect_features = {detect_features}
-_sample_size = {sample_size}
-_min_radius = {min_radius}
-_min_circularity = {min_circularity}
-
-# Collect mesh bodies
-_mesh_bodies = []
-_brep_bodies = []
-
-def _collect_bodies(comp, prefix=""):
-    full_name = prefix + comp.name if prefix else comp.name
-    # Mesh bodies
-    if hasattr(comp, 'meshBodies'):
-        for i in range(comp.meshBodies.count):
-            mb = comp.meshBodies.item(i)
-            if not _body_name or mb.name == _body_name:
-                _mesh_bodies.append((mb, full_name))
-    # BRep bodies (some imported STLs become BRep with many faces)
-    for i in range(comp.bRepBodies.count):
-        bb = comp.bRepBodies.item(i)
-        if not _body_name or bb.name == _body_name:
-            _brep_bodies.append((bb, full_name))
-    # Recurse into sub-components
-    for i in range(comp.occurrences.count):
-        occ = comp.occurrences.item(i)
-        _collect_bodies(occ.component, full_name + "/")
-
-_collect_bodies(rootComp)
-
-_report = {{"mesh_bodies": [], "brep_bodies": [], "summary": ""}}
-
-# --- Analyze mesh bodies (MeshBody type) ---
-for _mb, _comp_name in _mesh_bodies:
-    _info = {{
-        "name": _mb.name,
-        "component": _comp_name,
-        "type": "MeshBody",
-    }}
-    # Bounding box
-    try:
-        _bb = _mb.boundingBox
-        _info["bounding_box"] = {{
-            "min": [round(_bb.minPoint.x, 2), round(_bb.minPoint.y, 2), round(_bb.minPoint.z, 2)],
-            "max": [round(_bb.maxPoint.x, 2), round(_bb.maxPoint.y, 2), round(_bb.maxPoint.z, 2)],
-            "size": [
-                round(_bb.maxPoint.x - _bb.minPoint.x, 2),
-                round(_bb.maxPoint.y - _bb.minPoint.y, 2),
-                round(_bb.maxPoint.z - _bb.minPoint.z, 2),
-            ],
-        }}
-    except:
-        pass
-    # Mesh data via displayMesh
-    try:
-        _dm = _mb.displayMesh
-        _info["triangles"] = _dm.triangleCount
-        _info["vertices"] = _dm.nodeCount
-    except:
-        pass
-
-    # --- Feature detection for MeshBody via boundary edges ---
-    if _detect_features:
-        try:
-            _dm = _mb.displayMesh
-            _coords = _dm.nodeCoordinatesAsFloat  # flat [x0,y0,z0, x1,y1,z1, ...]
-            _indices = _dm.nodeIndices  # flat [t0v0,t0v1,t0v2, t1v0,...]
-            _tri_count = len(_indices) // 3
-
-            # Build edge count map — boundary edges appear only once
-            _edge_count = {{}}
-            for _ti in range(_tri_count):
-                _i0 = _indices[_ti * 3]
-                _i1 = _indices[_ti * 3 + 1]
-                _i2 = _indices[_ti * 3 + 2]
-                for _a, _b in [(_i0, _i1), (_i1, _i2), (_i2, _i0)]:
-                    _edge = (_a, _b) if _a < _b else (_b, _a)
-                    _edge_count[_edge] = _edge_count.get(_edge, 0) + 1
-
-            _boundary = [e for e, c in _edge_count.items() if c == 1]
-            _info["boundary_edges"] = len(_boundary)
-
-            if _boundary:
-                # Build adjacency graph from boundary edges
-                _adj = {{}}
-                for _a, _b in _boundary:
-                    if _a not in _adj: _adj[_a] = []
-                    if _b not in _adj: _adj[_b] = []
-                    _adj[_a].append(_b)
-                    _adj[_b].append(_a)
-
-                # Find connected components (contours)
-                _visited = set()
-                _contours = []
-                for _start in _adj:
-                    if _start in _visited:
-                        continue
-                    _component = []
-                    _stack = [_start]
-                    while _stack:
-                        _v = _stack.pop()
-                        if _v in _visited:
-                            continue
-                        _visited.add(_v)
-                        _component.append(_v)
-                        for _n in _adj[_v]:
-                            if _n not in _visited:
-                                _stack.append(_n)
-                    if len(_component) >= 3:
-                        _contours.append(_component)
-
-                # Analyze each contour — fit circle
-                _holes = []
-                for _cont in _contours:
-                    _pts_x = [_coords[vi * 3] for vi in _cont]
-                    _pts_y = [_coords[vi * 3 + 1] for vi in _cont]
-                    _pts_z = [_coords[vi * 3 + 2] for vi in _cont]
-
-                    _spread_x = max(_pts_x) - min(_pts_x)
-                    _spread_y = max(_pts_y) - min(_pts_y)
-                    _spread_z = max(_pts_z) - min(_pts_z)
-                    _spreads = [("X", _spread_x), ("Y", _spread_y), ("Z", _spread_z)]
-                    _spreads.sort(key=lambda s: s[1])
-
-                    # Axis with smallest spread = hole axis
-                    _hole_axis = _spreads[0][0]
-                    _min_spread = _spreads[0][1]
-
-                    # Use the other two axes for circle fitting
-                    if _hole_axis == "X":
-                        _u, _v_arr = _pts_y, _pts_z
-                    elif _hole_axis == "Y":
-                        _u, _v_arr = _pts_x, _pts_z
-                    else:
-                        _u, _v_arr = _pts_x, _pts_y
-
-                    _cu = sum(_u) / len(_u)
-                    _cv = sum(_v_arr) / len(_v_arr)
-
-                    # Average radius
-                    _radii = [_math.sqrt((_u[i] - _cu)**2 + (_v_arr[i] - _cv)**2) for i in range(len(_u))]
-                    _avg_r = sum(_radii) / len(_radii)
-                    _std_r = _math.sqrt(sum((r - _avg_r)**2 for r in _radii) / len(_radii))
-
-                    # Circularity score: low std/mean = good circle
-                    _circularity = 1.0 - min(_std_r / max(_avg_r, 0.01), 1.0)
-
-                    # Center in 3D
-                    if _hole_axis == "X":
-                        _center_3d = [round(sum(_pts_x) / len(_pts_x), 2), round(_cu, 2), round(_cv, 2)]
-                    elif _hole_axis == "Y":
-                        _center_3d = [round(_cu, 2), round(sum(_pts_y) / len(_pts_y), 2), round(_cv, 2)]
-                    else:
-                        _center_3d = [round(_cu, 2), round(_cv, 2), round(sum(_pts_z) / len(_pts_z), 2)]
-
-                    _holes.append({{
-                        "vertices_in_contour": len(_cont),
-                        "center_mm": _center_3d,
-                        "radius_mm": round(_avg_r, 2),
-                        "diameter_mm": round(_avg_r * 2, 2),
-                        "axis": _hole_axis,
-                        "circularity": round(_circularity, 3),
-                        "spread_along_axis_mm": round(_min_spread, 2),
-                        "type": "hole" if _circularity > 0.7 else "opening",
-                    }})
-
-                # --- Post-processing: filter, deduplicate, group, format ---
-                _raw_count = len(_holes)
-
-                # 1. Filter by min_radius, min_circularity, and min vertices
-                _holes = [h for h in _holes
-                          if h["radius_mm"] >= _min_radius
-                          and h["circularity"] >= _min_circularity
-                          and (h["vertices_in_contour"] >= 8 or h["circularity"] > 0.9)]
-
-                # 2. Deduplicate: merge contours with similar center + radius (same hole, top/bottom/inner wall)
-                _deduped = []
-                for _h in _holes:
-                    _merged = False
-                    for _d in _deduped:
-                        if _h["axis"] == _d["axis"] and abs(_h["radius_mm"] - _d["radius_mm"]) < 1.5:
-                            _dist = _math.sqrt(sum((_h["center_mm"][i] - _d["center_mm"][i])**2 for i in range(3)))
-                            if _dist < max(_h["radius_mm"] * 0.5, 5.0):
-                                if _h["circularity"] > _d["circularity"]:
-                                    _d["circularity"] = _h["circularity"]
-                                _d["_layers"] = _d.get("_layers", 1) + 1
-                                _merged = True
-                                break
-                    if not _merged:
-                        _h["_layers"] = 1
-                        _deduped.append(_h)
-
-                # 3. Group by similar radius + axis + spatial proximity
-                _deduped.sort(key=lambda h: (-h["circularity"], -h["radius_mm"]))
-                _groups = []
-                _used = set()
-                for _i, _h in enumerate(_deduped):
-                    if _i in _used:
-                        continue
-                    _group = [_h]
-                    _used.add(_i)
-                    for _j, _h2 in enumerate(_deduped):
-                        if _j in _used:
-                            continue
-                        if _h["axis"] == _h2["axis"] and abs(_h["radius_mm"] - _h2["radius_mm"]) < 2.0:
-                            # Only group if circularity is similar (both holes or both openings)
-                            if abs(_h["circularity"] - _h2["circularity"]) < 0.3:
-                                _group.append(_h2)
-                                _used.add(_j)
-                    _groups.append(_group)
-
-                # 4. Sort groups: highest circularity first, then largest radius
-                _groups.sort(key=lambda g: (-max(h["circularity"] for h in g), -g[0]["radius_mm"]))
-
-                # 5. Format as compact text table
-                _lines = []
-                _lines.append(f"Detected {{len(_deduped)}} unique openings (from {{_raw_count}} raw contours)")
-                _lines.append(f"Grouped into {{len(_groups)}} feature types:")
-                _lines.append("")
-                _lines.append(f"  {{'#':>3}} | {{'Count':>5}} | {{'Diam mm':>8}} | {{'Axis':>4}} | {{'Circ':>5}} | {{'Type':>7}} | Centers (mm)")
-                _lines.append("  " + "-" * 80)
-                for _gi, _g in enumerate(_groups):
-                    _avg_r = sum(h["radius_mm"] for h in _g) / len(_g)
-                    _best_circ = max(h["circularity"] for h in _g)
-                    _ftype = "hole" if _best_circ > 0.7 else "opening"
-                    # Format centers compactly
-                    _centers_str = ""
-                    for _ci, _c in enumerate(_g[:4]):
-                        _cx, _cy, _cz = _c["center_mm"]
-                        if _ci == 0:
-                            _centers_str += f"[{{_cx:.0f}}, {{_cy:.0f}}, {{_cz:.0f}}]"
-                        else:
-                            _centers_str += f" [{{_cx:.0f}}, {{_cy:.0f}}, {{_cz:.0f}}]"
-                    if len(_g) > 4:
-                        _centers_str += f" +{{len(_g)-4}} more"
-                    _lines.append(f"  {{_gi+1:>3}} | {{len(_g):>5}} | {{_avg_r*2:>8.1f}} | {{_g[0]['axis']:>4}} | {{_best_circ:>5.2f}} | {{_ftype:>7}} | {{_centers_str}}")
-                _lines.append("")
-
-                _info["analysis"] = "\\n".join(_lines)
-                _info["feature_count"] = len(_groups)
-                _info["unique_openings"] = len(_deduped)
-                # Also keep structured data but minimal
-                _info["features"] = []
-                for _g in _groups:
-                    _avg_r = sum(h["radius_mm"] for h in _g) / len(_g)
-                    _best_circ = max(h["circularity"] for h in _g)
-                    _info["features"].append({{
-                        "count": len(_g),
-                        "diameter_mm": round(_avg_r * 2, 1),
-                        "axis": _g[0]["axis"],
-                        "circularity": round(_best_circ, 2),
-                        "centers_mm": [h["center_mm"] for h in _g[:4]],
-                    }})
-            else:
-                _info["boundary_edges"] = 0
-                _info["analysis"] = "Watertight mesh — no open boundaries detected"
-                _info["features"] = []
-
-            # --- Surface segmentation by normal direction ---
-            _sample_n = min(_tri_count, _sample_size)
-            _step = max(1, _tri_count // _sample_n)
-            _THRESH = 0.7  # cos(45°) — threshold for axis alignment
-
-            # Categories: top(Z+), bottom(Z-), front(Y-), back(Y+), left(X-), right(X+), angled
-            _cats = {{
-                "top_Zplus":    {{"count": 0, "area": 0.0, "xs": [], "ys": [], "zs": []}},
-                "bottom_Zminus":{{"count": 0, "area": 0.0, "xs": [], "ys": [], "zs": []}},
-                "front_Yminus": {{"count": 0, "area": 0.0, "xs": [], "ys": [], "zs": []}},
-                "back_Yplus":   {{"count": 0, "area": 0.0, "xs": [], "ys": [], "zs": []}},
-                "left_Xminus":  {{"count": 0, "area": 0.0, "xs": [], "ys": [], "zs": []}},
-                "right_Xplus":  {{"count": 0, "area": 0.0, "xs": [], "ys": [], "zs": []}},
-                "angled":       {{"count": 0, "area": 0.0, "xs": [], "ys": [], "zs": []}},
-            }}
-
-            for _si in range(0, _tri_count, _step):
-                _i0 = _indices[_si * 3]
-                _i1 = _indices[_si * 3 + 1]
-                _i2 = _indices[_si * 3 + 2]
-                _ax = _coords[_i0*3]; _ay = _coords[_i0*3+1]; _az = _coords[_i0*3+2]
-                _bx = _coords[_i1*3]; _by = _coords[_i1*3+1]; _bz = _coords[_i1*3+2]
-                _cx = _coords[_i2*3]; _cy = _coords[_i2*3+1]; _cz = _coords[_i2*3+2]
-
-                # Normal via cross product
-                _e1x = _bx-_ax; _e1y = _by-_ay; _e1z = _bz-_az
-                _e2x = _cx-_ax; _e2y = _cy-_ay; _e2z = _cz-_az
-                _nnx = _e1y*_e2z - _e1z*_e2y
-                _nny = _e1z*_e2x - _e1x*_e2z
-                _nnz = _e1x*_e2y - _e1y*_e2x
-                _nlen = _math.sqrt(_nnx**2 + _nny**2 + _nnz**2)
-                if _nlen == 0:
-                    continue
-                _nnx /= _nlen; _nny /= _nlen; _nnz /= _nlen
-
-                # Triangle area (half cross product magnitude) in mm²
-                _tri_area = _nlen * 0.5  # area in document units² (mm²)
-
-                # Centroid in mm
-                _cenx = (_ax + _bx + _cx) / 3.0
-                _ceny = (_ay + _by + _cy) / 3.0
-                _cenz = (_az + _bz + _cz) / 3.0
-
-                # Classify by dominant normal direction
-                if _nnz > _THRESH:
-                    _cat = "top_Zplus"
-                elif _nnz < -_THRESH:
-                    _cat = "bottom_Zminus"
-                elif _nny < -_THRESH:
-                    _cat = "front_Yminus"
-                elif _nny > _THRESH:
-                    _cat = "back_Yplus"
-                elif _nnx < -_THRESH:
-                    _cat = "left_Xminus"
-                elif _nnx > _THRESH:
-                    _cat = "right_Xplus"
-                else:
-                    _cat = "angled"
-
-                _c = _cats[_cat]
-                _c["count"] += 1
-                _c["area"] += _tri_area
-                # Sample positions (keep max 200 per category for bbox)
-                if len(_c["xs"]) < 200:
-                    _c["xs"].append(_cenx)
-                    _c["ys"].append(_ceny)
-                    _c["zs"].append(_cenz)
-
-            _sampled = sum(c["count"] for c in _cats.values())
-
-            # Build surface segmentation report
-            _seg_lines = []
-            _seg_lines.append(f"Surface segmentation ({{_sampled}} triangles sampled):")
-            _seg_lines.append("")
-
-            _labels = {{
-                "top_Zplus": "Top (Z+)",
-                "bottom_Zminus": "Bottom (Z-)",
-                "front_Yminus": "Front (Y-)",
-                "back_Yplus": "Back (Y+)",
-                "left_Xminus": "Left (X-)",
-                "right_Xplus": "Right (X+)",
-                "angled": "Angled/Curved",
-            }}
-
-            _seg_data = []
-            for _key, _label in _labels.items():
-                _c = _cats[_key]
-                if _c["count"] == 0:
-                    continue
-                _pct = round(100 * _c["count"] / max(_sampled, 1), 1)
-                _area_mm2 = _c["area"] * _step  # scale up from sampling
-                _region = {{
-                    "name": _label,
-                    "pct": _pct,
-                    "area_mm2": round(_area_mm2, 0),
-                    "triangles": _c["count"] * _step,
-                }}
-                if _c["xs"]:
-                    _region["bbox_mm"] = {{
-                        "x": [round(min(_c["xs"]), 1), round(max(_c["xs"]), 1)],
-                        "y": [round(min(_c["ys"]), 1), round(max(_c["ys"]), 1)],
-                        "z": [round(min(_c["zs"]), 1), round(max(_c["zs"]), 1)],
-                    }}
-                _seg_data.append(_region)
-
-                # Text line
-                _bbox_str = ""
-                if _c["xs"]:
-                    _bbox_str = (f"X[{{min(_c['xs']):.0f}}..{{max(_c['xs']):.0f}}] "
-                                 f"Y[{{min(_c['ys']):.0f}}..{{max(_c['ys']):.0f}}] "
-                                 f"Z[{{min(_c['zs']):.0f}}..{{max(_c['zs']):.0f}}]")
-                _seg_lines.append(f"  {{_label:>16}}: {{_pct:>5.1f}}%  ~{{_area_mm2:.0f}} mm²  {{_bbox_str}}")
-
-            _info["surface_segmentation"] = "\\n".join(_seg_lines)
-            _info["segments"] = _seg_data
-
-        except Exception as _ex:
-            _info["feature_detection_error"] = str(_ex)
-
-    _report["mesh_bodies"].append(_info)
-
-# --- Analyze BRep bodies (imported STL often becomes BRep) ---
-for _bb_body, _comp_name in _brep_bodies:
-    _info = {{
-        "name": _bb_body.name,
-        "component": _comp_name,
-        "type": "BRepBody",
-        "faces": _bb_body.faces.count,
-        "edges": _bb_body.edges.count,
-        "vertices": _bb_body.vertices.count,
-    }}
-    # Bounding box
-    try:
-        _bb = _bb_body.boundingBox
-        _info["bounding_box"] = {{
-            "min": [round(_bb.minPoint.x, 2), round(_bb.minPoint.y, 2), round(_bb.minPoint.z, 2)],
-            "max": [round(_bb.maxPoint.x, 2), round(_bb.maxPoint.y, 2), round(_bb.maxPoint.z, 2)],
-            "size": [
-                round(_bb.maxPoint.x - _bb.minPoint.x, 2),
-                round(_bb.maxPoint.y - _bb.minPoint.y, 2),
-                round(_bb.maxPoint.z - _bb.minPoint.z, 2),
-            ],
-        }}
-    except:
-        pass
-    # Physical properties
-    try:
-        _props = _bb_body.physicalProperties
-        _info["volume_cm3"] = round(_props.volume, 4)
-        _info["area_cm2"] = round(_props.area, 4)
-    except:
-        pass
-
-    # Mesh triangle count (via mesh calculator)
-    try:
-        _mc = _bb_body.meshManager.createMeshCalculator()
-        _mc.setQuality(adsk.fusion.TriangleMeshQualityOptions.NormalQualityTriangleMesh)
-        _mesh = _mc.calculate()
-        _info["triangles"] = _mesh.triangleCount
-        _info["mesh_vertices"] = _mesh.nodeCount
-    except:
-        pass
-
-    # --- Feature detection on BRep ---
-    if _detect_features and _bb_body.faces.count < 50000:
-        _features = []
-        _face_count = _bb_body.faces.count
-
-        # Classify faces by geometry type
-        _planar = 0
-        _cylindrical = []
-        _conical = 0
-        _spherical = 0
-        _toroidal = 0
-        _other = 0
-
-        _limit = min(_face_count, _sample_size)
-        for _fi in range(_limit):
-            _face = _bb_body.faces.item(_fi)
-            _geom = _face.geometry
-            _gt = _geom.objectType
-
-            if "Plane" in _gt:
-                _planar += 1
-            elif "Cylinder" in _gt:
-                _cyl_geom = adsk.core.Cylinder.cast(_geom)
-                if _cyl_geom:
-                    _r = round(_cyl_geom.radius, 3)
-                    _origin = _cyl_geom.origin
-                    _axis_vec = _cyl_geom.axis
-                    # Determine axis direction
-                    _ax = "?"
-                    _avx, _avy, _avz = abs(_axis_vec.x), abs(_axis_vec.y), abs(_axis_vec.z)
-                    if _avz > _avx and _avz > _avy: _ax = "Z"
-                    elif _avx > _avy: _ax = "X"
-                    else: _ax = "Y"
-                    _cylindrical.append({{
-                        "radius_mm": _r,
-                        "center_mm": [round(_origin.x, 2), round(_origin.y, 2), round(_origin.z, 2)],
-                        "axis": _ax,
-                    }})
-            elif "Cone" in _gt:
-                _conical += 1
-            elif "Sphere" in _gt:
-                _spherical += 1
-            elif "Torus" in _gt:
-                _toroidal += 1
-            else:
-                _other += 1
-
-        _info["face_types"] = {{
-            "planar": _planar,
-            "cylindrical": len(_cylindrical),
-            "conical": _conical,
-            "spherical": _spherical,
-            "toroidal": _toroidal,
-            "other": _other,
-            "sampled": _limit,
-            "total": _face_count,
-        }}
-
-        # Group cylindrical faces by similar radius + position → holes/pins
-        if _cylindrical:
-            # Cluster by radius (within 0.1mm tolerance)
-            _cyl_sorted = sorted(_cylindrical, key=lambda c: c["radius_mm"])
-            _clusters = []
-            _current = [_cyl_sorted[0]]
-            for _c in _cyl_sorted[1:]:
-                if abs(_c["radius_mm"] - _current[0]["radius_mm"]) < 0.1:
-                    _current.append(_c)
-                else:
-                    _clusters.append(_current)
-                    _current = [_c]
-            _clusters.append(_current)
-
-            _hole_groups = []
-            for _cl in _clusters:
-                _avg_r = sum(c["radius_mm"] for c in _cl) / len(_cl)
-                # Deduplicate centers (within 1mm)
-                _unique_centers = []
-                for _c in _cl:
-                    _is_dup = False
-                    for _uc in _unique_centers:
-                        _dist = _math.sqrt(sum((_c["center_mm"][i] - _uc[i])**2 for i in range(3)))
-                        if _dist < 1.0:
-                            _is_dup = True
-                            break
-                    if not _is_dup:
-                        _unique_centers.append(_c["center_mm"])
-
-                _hole_groups.append({{
-                    "radius_mm": round(_avg_r, 2),
-                    "diameter_mm": round(_avg_r * 2, 2),
-                    "count": len(_unique_centers),
-                    "axis": _cl[0]["axis"],
-                    "centers_mm": _unique_centers[:10],  # cap at 10
-                }})
-
-            _info["cylindrical_features"] = _hole_groups
-
-    _report["brep_bodies"].append(_info)
-
-# Summary
-_total = len(_report["mesh_bodies"]) + len(_report["brep_bodies"])
-if _total == 0:
-    if _body_name:
-        print(f"Body '{{_body_name}}' not found.")
-        print("Available bodies:")
-        # List all bodies
-        def _list_all(comp, indent=0):
-            for i in range(comp.bRepBodies.count):
-                print("  " * indent + f"  BRep: {{comp.bRepBodies.item(i).name}}")
-            if hasattr(comp, 'meshBodies'):
-                for i in range(comp.meshBodies.count):
-                    print("  " * indent + f"  Mesh: {{comp.meshBodies.item(i).name}}")
-            for i in range(comp.occurrences.count):
-                occ = comp.occurrences.item(i)
-                print("  " * indent + f"  Component: {{occ.component.name}}")
-                _list_all(occ.component, indent + 1)
-        _list_all(rootComp)
-    else:
-        print("No bodies found in current design.")
-else:
-    # Print compact summary for each body
-    for _body_info in _report["mesh_bodies"] + _report["brep_bodies"]:
-        print(f"=== {{_body_info['name']}} ({{_body_info['type']}}) ===")
-        if "bounding_box" in _body_info:
-            _sz = _body_info["bounding_box"]["size"]
-            print(f"  Size: {{_sz[0]:.0f}} x {{_sz[1]:.0f}} x {{_sz[2]:.0f}} mm")
-        if "triangles" in _body_info:
-            print(f"  Triangles: {{_body_info['triangles']:,}}, Vertices: {{_body_info.get('vertices', _body_info.get('mesh_vertices', '?')):,}}")
-        if "faces" in _body_info:
-            print(f"  Faces: {{_body_info['faces']:,}}, Edges: {{_body_info['edges']:,}}")
-        if "volume_cm3" in _body_info:
-            print(f"  Volume: {{_body_info['volume_cm3']}} cm3, Area: {{_body_info['area_cm2']}} cm2")
-        if "boundary_edges" in _body_info:
-            print(f"  Boundary edges: {{_body_info['boundary_edges']:,}}")
-        if "surface_segmentation" in _body_info:
-            print()
-            print(_body_info["surface_segmentation"])
-        if "analysis" in _body_info:
-            print()
-            print(_body_info["analysis"])
-        # Print structured features as compact JSON for programmatic use
-        if _body_info.get("features"):
-            print("--- features_json ---")
-            print(_json.dumps(_body_info["features"], ensure_ascii=False))
-        print()
-'''
-        result = await _send_to_fusion(analyze_code, render=True, timeout=60)
-        contents = _build_response(result)
-        return contents
+        if stl_path:
+            # --- Pure Python path: read STL directly ---
+            return _mesh_analyze_stl(
+                stl_path, detect_features, sample_size, min_radius, min_circularity
+            )
+        else:
+            # --- Fusion path: use displayMesh (legacy) ---
+            result = await _send_to_fusion(
+                _mesh_analyze_fusion_code(body_name, detect_features, sample_size, min_radius, min_circularity),
+                render=True, timeout=60,
+            )
+            contents = _build_response(result)
+            return contents
 
     elif name == "mesh_modify":
         import struct
@@ -1731,6 +1175,337 @@ print("Use highlight with clear=true to remove markers")
 
     else:
         return [TextContent(type="text", text=f"Unknown tool: {name}")]
+
+
+def _mesh_analyze_stl(
+    stl_path: str,
+    detect_features: bool,
+    sample_size: int,
+    min_radius: float,
+    min_circularity: float,
+) -> list[TextContent]:
+    """Analyze an STL file using pure Python — no Fusion needed."""
+    import struct
+    import math
+    import json
+
+    stl_path = os.path.expanduser(stl_path)
+    with open(stl_path, "rb") as f:
+        header = f.read(80)
+        n_tris = struct.unpack("<I", f.read(4))[0]
+
+        # Read all triangles: normals + 3 vertices each
+        tri_normals = []  # [(nx, ny, nz), ...]
+        tri_verts = []  # [(v0, v1, v2), ...] where vi = (x, y, z)
+        for _ in range(n_tris):
+            nx, ny, nz = struct.unpack("<fff", f.read(12))
+            v0 = struct.unpack("<fff", f.read(12))
+            v1 = struct.unpack("<fff", f.read(12))
+            v2 = struct.unpack("<fff", f.read(12))
+            f.read(2)  # attribute
+            tri_normals.append((nx, ny, nz))
+            tri_verts.append((v0, v1, v2))
+
+    # Build indexed mesh: merge coincident vertices
+    vert_to_idx: dict[tuple, int] = {}
+    coords: list[float] = []  # flat [x0,y0,z0, x1,y1,z1, ...]
+    indices: list[int] = []  # flat [t0v0,t0v1,t0v2, ...]
+
+    for v0, v1, v2 in tri_verts:
+        for v in (v0, v1, v2):
+            key = (round(v[0], 5), round(v[1], 5), round(v[2], 5))
+            if key not in vert_to_idx:
+                vert_to_idx[key] = len(vert_to_idx)
+                coords.extend(key)
+            indices.append(vert_to_idx[key])
+
+    n_verts = len(vert_to_idx)
+    tri_count = len(tri_verts)
+
+    # Bounding box
+    xs = coords[0::3]
+    ys = coords[1::3]
+    zs = coords[2::3]
+    bb_min = [min(xs), min(ys), min(zs)]
+    bb_max = [max(xs), max(ys), max(zs)]
+    bb_size = [bb_max[i] - bb_min[i] for i in range(3)]
+
+    lines = []
+    lines.append(f"=== {os.path.basename(stl_path)} (STL, pure Python) ===")
+    lines.append(f"  Size: {bb_size[0]:.1f} x {bb_size[1]:.1f} x {bb_size[2]:.1f} mm")
+    lines.append(f"  Triangles: {tri_count:,}, Vertices: {n_verts:,}")
+
+    # --- Surface segmentation ---
+    sample_n = min(tri_count, sample_size)
+    step = max(1, tri_count // sample_n)
+    THRESH = 0.7
+
+    cats = {
+        "top_Zplus": {"count": 0, "area": 0.0, "xs": [], "ys": [], "zs": []},
+        "bottom_Zminus": {"count": 0, "area": 0.0, "xs": [], "ys": [], "zs": []},
+        "front_Yminus": {"count": 0, "area": 0.0, "xs": [], "ys": [], "zs": []},
+        "back_Yplus": {"count": 0, "area": 0.0, "xs": [], "ys": [], "zs": []},
+        "left_Xminus": {"count": 0, "area": 0.0, "xs": [], "ys": [], "zs": []},
+        "right_Xplus": {"count": 0, "area": 0.0, "xs": [], "ys": [], "zs": []},
+        "angled": {"count": 0, "area": 0.0, "xs": [], "ys": [], "zs": []},
+    }
+
+    for si in range(0, tri_count, step):
+        v0, v1, v2 = tri_verts[si]
+        e1 = (v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2])
+        e2 = (v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2])
+        nnx = e1[1] * e2[2] - e1[2] * e2[1]
+        nny = e1[2] * e2[0] - e1[0] * e2[2]
+        nnz = e1[0] * e2[1] - e1[1] * e2[0]
+        nlen = math.sqrt(nnx**2 + nny**2 + nnz**2)
+        if nlen == 0:
+            continue
+        nnx /= nlen; nny /= nlen; nnz /= nlen
+        tri_area = nlen * 0.5
+        cenx = (v0[0] + v1[0] + v2[0]) / 3
+        ceny = (v0[1] + v1[1] + v2[1]) / 3
+        cenz = (v0[2] + v1[2] + v2[2]) / 3
+
+        if nnz > THRESH: cat = "top_Zplus"
+        elif nnz < -THRESH: cat = "bottom_Zminus"
+        elif nny < -THRESH: cat = "front_Yminus"
+        elif nny > THRESH: cat = "back_Yplus"
+        elif nnx < -THRESH: cat = "left_Xminus"
+        elif nnx > THRESH: cat = "right_Xplus"
+        else: cat = "angled"
+
+        c = cats[cat]
+        c["count"] += 1
+        c["area"] += tri_area
+        if len(c["xs"]) < 200:
+            c["xs"].append(cenx); c["ys"].append(ceny); c["zs"].append(cenz)
+
+    sampled = sum(c["count"] for c in cats.values())
+    labels = {
+        "top_Zplus": "Top (Z+)", "bottom_Zminus": "Bottom (Z-)",
+        "front_Yminus": "Front (Y-)", "back_Yplus": "Back (Y+)",
+        "left_Xminus": "Left (X-)", "right_Xplus": "Right (X+)",
+        "angled": "Angled/Curved",
+    }
+    lines.append(f"\nSurface segmentation ({sampled} triangles sampled):\n")
+    for key, label in labels.items():
+        c = cats[key]
+        if c["count"] == 0:
+            continue
+        pct = round(100 * c["count"] / max(sampled, 1), 1)
+        area = c["area"] * step
+        bbox = ""
+        if c["xs"]:
+            bbox = (f"X[{min(c['xs']):.0f}..{max(c['xs']):.0f}] "
+                    f"Y[{min(c['ys']):.0f}..{max(c['ys']):.0f}] "
+                    f"Z[{min(c['zs']):.0f}..{max(c['zs']):.0f}]")
+        lines.append(f"  {label:>16}: {pct:>5.1f}%  ~{area:.0f} mm²  {bbox}")
+
+    # --- Feature detection via boundary edges ---
+    features_json = []
+    if detect_features:
+        edge_count: dict[tuple, int] = {}
+        for ti in range(tri_count):
+            i0, i1, i2 = indices[ti * 3], indices[ti * 3 + 1], indices[ti * 3 + 2]
+            for a, b in ((i0, i1), (i1, i2), (i2, i0)):
+                edge = (a, b) if a < b else (b, a)
+                edge_count[edge] = edge_count.get(edge, 0) + 1
+
+        boundary = [e for e, c in edge_count.items() if c == 1]
+        lines.append(f"\n  Boundary edges: {len(boundary):,}")
+
+        if boundary:
+            adj: dict[int, list[int]] = {}
+            for a, b in boundary:
+                adj.setdefault(a, []).append(b)
+                adj.setdefault(b, []).append(a)
+
+            visited: set[int] = set()
+            contours: list[list[int]] = []
+            for start in adj:
+                if start in visited:
+                    continue
+                comp = []
+                stack = [start]
+                while stack:
+                    v = stack.pop()
+                    if v in visited:
+                        continue
+                    visited.add(v)
+                    comp.append(v)
+                    for n in adj[v]:
+                        if n not in visited:
+                            stack.append(n)
+                if len(comp) >= 3:
+                    contours.append(comp)
+
+            holes = []
+            for cont in contours:
+                pts_x = [coords[vi * 3] for vi in cont]
+                pts_y = [coords[vi * 3 + 1] for vi in cont]
+                pts_z = [coords[vi * 3 + 2] for vi in cont]
+
+                spreads = sorted(
+                    [("X", max(pts_x) - min(pts_x)),
+                     ("Y", max(pts_y) - min(pts_y)),
+                     ("Z", max(pts_z) - min(pts_z))],
+                    key=lambda s: s[1],
+                )
+                hole_axis = spreads[0][0]
+
+                if hole_axis == "X": u, v_arr = pts_y, pts_z
+                elif hole_axis == "Y": u, v_arr = pts_x, pts_z
+                else: u, v_arr = pts_x, pts_y
+
+                cu = sum(u) / len(u)
+                cv = sum(v_arr) / len(v_arr)
+                radii = [math.sqrt((u[i] - cu)**2 + (v_arr[i] - cv)**2) for i in range(len(u))]
+                avg_r = sum(radii) / len(radii)
+                std_r = math.sqrt(sum((r - avg_r)**2 for r in radii) / len(radii))
+                circularity = 1.0 - min(std_r / max(avg_r, 0.01), 1.0)
+
+                if hole_axis == "X":
+                    center_3d = [round(sum(pts_x) / len(pts_x), 2), round(cu, 2), round(cv, 2)]
+                elif hole_axis == "Y":
+                    center_3d = [round(cu, 2), round(sum(pts_y) / len(pts_y), 2), round(cv, 2)]
+                else:
+                    center_3d = [round(cu, 2), round(cv, 2), round(sum(pts_z) / len(pts_z), 2)]
+
+                holes.append({
+                    "vertices_in_contour": len(cont), "center_mm": center_3d,
+                    "radius_mm": round(avg_r, 2), "axis": hole_axis,
+                    "circularity": round(circularity, 3),
+                })
+
+            raw_count = len(holes)
+            holes = [h for h in holes
+                     if h["radius_mm"] >= min_radius
+                     and h["circularity"] >= min_circularity
+                     and (h["vertices_in_contour"] >= 8 or h["circularity"] > 0.9)]
+
+            # Deduplicate
+            deduped = []
+            for h in holes:
+                merged = False
+                for d in deduped:
+                    if h["axis"] == d["axis"] and abs(h["radius_mm"] - d["radius_mm"]) < 1.5:
+                        dist = math.sqrt(sum((h["center_mm"][i] - d["center_mm"][i])**2 for i in range(3)))
+                        if dist < max(h["radius_mm"] * 0.5, 5.0):
+                            if h["circularity"] > d["circularity"]:
+                                d["circularity"] = h["circularity"]
+                            merged = True
+                            break
+                if not merged:
+                    deduped.append(h)
+
+            # Group
+            deduped.sort(key=lambda h: (-h["circularity"], -h["radius_mm"]))
+            groups = []
+            used: set[int] = set()
+            for i, h in enumerate(deduped):
+                if i in used:
+                    continue
+                group = [h]
+                used.add(i)
+                for j, h2 in enumerate(deduped):
+                    if j in used:
+                        continue
+                    if h["axis"] == h2["axis"] and abs(h["radius_mm"] - h2["radius_mm"]) < 2.0:
+                        if abs(h["circularity"] - h2["circularity"]) < 0.3:
+                            group.append(h2)
+                            used.add(j)
+                groups.append(group)
+            groups.sort(key=lambda g: (-max(h["circularity"] for h in g), -g[0]["radius_mm"]))
+
+            lines.append(f"\nDetected {len(deduped)} unique openings (from {raw_count} raw contours)")
+            lines.append(f"Grouped into {len(groups)} feature types:\n")
+            lines.append(f"  {'#':>3} | {'Count':>5} | {'Diam mm':>8} | {'Axis':>4} | {'Circ':>5} | {'Type':>7} | Centers (mm)")
+            lines.append("  " + "-" * 80)
+            for gi, g in enumerate(groups):
+                avg_r = sum(h["radius_mm"] for h in g) / len(g)
+                best_circ = max(h["circularity"] for h in g)
+                ftype = "hole" if best_circ > 0.7 else "opening"
+                centers_str = ""
+                for ci, c in enumerate(g[:4]):
+                    cx, cy, cz = c["center_mm"]
+                    if ci == 0:
+                        centers_str += f"[{cx:.0f}, {cy:.0f}, {cz:.0f}]"
+                    else:
+                        centers_str += f" [{cx:.0f}, {cy:.0f}, {cz:.0f}]"
+                if len(g) > 4:
+                    centers_str += f" +{len(g) - 4} more"
+                lines.append(f"  {gi+1:>3} | {len(g):>5} | {avg_r*2:>8.1f} | {g[0]['axis']:>4} | {best_circ:>5.2f} | {ftype:>7} | {centers_str}")
+
+            for g in groups:
+                avg_r = sum(h["radius_mm"] for h in g) / len(g)
+                best_circ = max(h["circularity"] for h in g)
+                features_json.append({
+                    "count": len(g), "diameter_mm": round(avg_r * 2, 1),
+                    "axis": g[0]["axis"], "circularity": round(best_circ, 2),
+                    "centers_mm": [h["center_mm"] for h in g[:4]],
+                })
+        else:
+            lines.append("  Watertight mesh — no open boundaries")
+
+    if features_json:
+        lines.append("\n--- features_json ---")
+        lines.append(json.dumps(features_json, ensure_ascii=False))
+
+    return [TextContent(type="text", text="\n".join(lines))]
+
+
+def _mesh_analyze_fusion_code(
+    body_name: str, detect_features: bool, sample_size: int,
+    min_radius: float, min_circularity: float,
+) -> str:
+    """Return the Fusion-side Python script for mesh_analyze (legacy path)."""
+    return f'''
+import json as _json
+import math as _math
+
+_body_name = "{body_name}"
+_detect_features = {detect_features}
+_sample_size = {sample_size}
+_min_radius = {min_radius}
+_min_circularity = {min_circularity}
+
+_mesh_bodies = []
+_brep_bodies = []
+
+def _collect_bodies(comp, prefix=""):
+    full_name = prefix + comp.name if prefix else comp.name
+    if hasattr(comp, 'meshBodies'):
+        for i in range(comp.meshBodies.count):
+            mb = comp.meshBodies.item(i)
+            if not _body_name or mb.name == _body_name:
+                _mesh_bodies.append((mb, full_name))
+    for i in range(comp.bRepBodies.count):
+        bb = comp.bRepBodies.item(i)
+        if not _body_name or bb.name == _body_name:
+            _brep_bodies.append((bb, full_name))
+    for i in range(comp.occurrences.count):
+        occ = comp.occurrences.item(i)
+        _collect_bodies(occ.component, full_name + "/")
+
+_collect_bodies(rootComp)
+
+if not _mesh_bodies and not _brep_bodies:
+    if _body_name:
+        print(f"Body '{{_body_name}}' not found.")
+    else:
+        print("No bodies found. Use stl_path parameter for direct STL analysis.")
+else:
+    for _mb, _comp_name in _mesh_bodies:
+        _dm = _mb.displayMesh
+        print(f"=== {{_mb.name}} (MeshBody via Fusion) ===")
+        print(f"  Triangles: {{_dm.triangleCount:,}}, Vertices: {{_dm.nodeCount:,}}")
+        _bb = _mb.boundingBox
+        print(f"  BBox: [{{_bb.minPoint.x:.1f}}, {{_bb.minPoint.y:.1f}}, {{_bb.minPoint.z:.1f}}] to [{{_bb.maxPoint.x:.1f}}, {{_bb.maxPoint.y:.1f}}, {{_bb.maxPoint.z:.1f}}]")
+        print("  Note: Use stl_path for full analysis (features, segmentation)")
+    for _bb_body, _comp_name in _brep_bodies:
+        print(f"=== {{_bb_body.name}} (BRepBody) ===")
+        print(f"  Faces: {{_bb_body.faces.count:,}}, Edges: {{_bb_body.edges.count:,}}")
+'''
 
 
 def _build_response(result: dict) -> list[TextContent | ImageContent]:
