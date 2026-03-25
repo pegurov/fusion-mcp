@@ -1124,50 +1124,65 @@ else:
         label = arguments.get("label", "")
         clear = arguments.get("clear", False)
 
-        # Position in document units (mm). Fusion API uses cm internally,
-        # but for mesh bodies we work in document units directly.
-        # We create a sketch circle as a lightweight marker.
         px, py, pz = position[0], position[1], position[2]
         label_str = label or f"({px:.1f}, {py:.1f}, {pz:.1f})"
 
-        highlight_code = f"""
-import adsk.core, adsk.fusion, math
+        # Fusion API uses cm internally; mesh displayMesh uses document units (mm).
+        # For mesh bodies coordinates are in mm, so we convert to cm for Fusion API.
+        # The sphere center and camera target use cm.
+        cx, cy, cz = px / 10.0, py / 10.0, pz / 10.0
+        r_cm = radius / 10.0
 
-# Clear previous markers if requested
+        highlight_code = f"""
+import adsk.core, adsk.fusion
+
+# Clear previous markers
 if {clear}:
     deleted = 0
-    for i in range(rootComp.sketches.count - 1, -1, -1):
-        sk = rootComp.sketches.item(i)
-        if sk.name.startswith("_highlight_"):
-            sk.deleteMe()
+    for i in range(rootComp.bRepBodies.count - 1, -1, -1):
+        b = rootComp.bRepBodies.item(i)
+        if b.name.startswith("_marker_"):
+            b.deleteMe()
             deleted += 1
     if deleted:
         print(f"Cleared {{deleted}} previous markers")
 
-# Create marker sketch on XY plane
-sk = rootComp.sketches.add(rootComp.xYConstructionPlane)
-sk.name = "_highlight_{label_str.replace(' ', '_')[:20]}"
-sk.isVisible = True
+# Create sphere via TemporaryBRepManager
+tbm = adsk.fusion.TemporaryBRepManager.get()
+center = adsk.core.Point3D.create({cx}, {cy}, {cz})
+sphere = tbm.createSphere(center, {r_cm})
 
-# Draw a circle at the projected XY position
-# Note: sketch coordinates are in cm for BRep, but we pass raw values
-# For mesh display, these are document units
-center = adsk.core.Point3D.create({px}, {py}, {pz})
+# In Direct Design, need BaseFeature to add BRep body
+try:
+    bf = rootComp.features.baseFeatures.add()
+    bf.startEdit()
+    body = rootComp.bRepBodies.add(sphere, bf)
+    body.name = "_marker_{label_str.replace(' ', '_')[:20]}"
+    body.opacity = 0.4
+    bf.finishEdit()
+    print(f"Marker sphere at [{px:.1f}, {py:.1f}, {pz:.1f}] r={radius}mm")
+except Exception as e:
+    # Fallback: try without BaseFeature (parametric mode)
+    try:
+        body = rootComp.bRepBodies.add(sphere)
+        body.name = "_marker_{label_str.replace(' ', '_')[:20]}"
+        print(f"Marker sphere at [{px:.1f}, {py:.1f}, {pz:.1f}] r={radius}mm")
+    except Exception as e2:
+        print(f"Could not create marker: {{e2}}")
 
-# Draw 3 circles in 3 planes to make a sphere-like marker
-circles = sk.sketchCurves.sketchCircles
-c1 = circles.addByCenterRadius(adsk.core.Point3D.create({px}, {py}, 0), {radius})
-
-# Create another sketch on XZ plane for visibility from side
-sk2 = rootComp.sketches.add(rootComp.xZConstructionPlane)
-sk2.name = "_highlight_side"
-sk2.isVisible = True
-c2 = sk2.sketchCurves.sketchCircles.addByCenterRadius(
-    adsk.core.Point3D.create({px}, {pz}, 0), {radius})
-
-print(f"Marker placed at [{px:.2f}, {py:.2f}, {pz:.2f}] radius={radius}mm")
 print(f"Label: {label_str}")
-print("Use highlight with clear=true to remove markers")
+
+# Point camera at the marker for close-up view
+_vp = app.activeViewport
+_cam = _vp.camera
+_cam.isSmoothTransition = False
+_cam.target = adsk.core.Point3D.create({cx}, {cy}, {cz})
+_cam.eye = adsk.core.Point3D.create({cx} + 3, {cy} - 3, {cz} + 2)
+_cam.upVector = adsk.core.Vector3D.create(0, 0, 1)
+_vp.camera = _cam
+adsk.doEvents()
+
+print("Camera pointed at marker. Use clear=true to remove.")
 """
         result = await _send_to_fusion(highlight_code, render=True)
         contents = _build_response(result)
