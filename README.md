@@ -28,6 +28,15 @@ Claude Code  ←→  MCP Server (stdio)  ←→  exchange/  ←→  Fusion 360 A
 
 The `execute_design` script context has these globals: `app`, `ui`, `design`, `rootComp`, `adsk`.
 
+### Mesh tools
+
+| Tool | Description |
+|------|-------------|
+| `mesh_analyze` | Reverse-engineer mesh bodies (STL/OBJ): detect holes, circular features, surface segmentation. Returns compact summary instead of raw triangle data |
+| `mesh_modify` | Modify STL files via pure Python (no Fusion needed). Supports `radial_displacement` to shrink/expand cylindrical holes |
+| `highlight` | Place visual markers on the model to verify feature identification before modifying |
+| `api_docs` | Search Fusion 360 API via live introspection — discover classes, methods, properties |
+
 ### Convenience
 
 | Tool | Description |
@@ -54,6 +63,24 @@ measure(body_name="External Frame", body_name_2="Insert Bottom")
 
 # Section view at Y=0 to see internal holes
 section_view(axis="y", offset=0)
+
+# Analyze a mesh body — find holes, features, surfaces
+mesh_analyze(min_radius=2, min_circularity=0.7)
+
+# Modify STL: shrink motor hole from r=3.1 to r=3.0
+mesh_modify(
+    stl_input="~/Desktop/car.stl",
+    stl_output="~/Desktop/car_fixed.stl",
+    operation="radial_displacement",
+    axis="X",
+    center=[40.8, 4.2],    # YZ center from mesh_analyze
+    current_radius=3.1,
+    target_radius=3.0,
+    tolerance=0.05
+)
+
+# Place a marker to verify feature location
+highlight(position=[30, 40.8, 4.2], radius=2, label="rear motor hole")
 ```
 
 ## Installation

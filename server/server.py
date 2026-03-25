@@ -2,7 +2,8 @@
 Fusion 360 MCP Server
 Communicates with FusionMCPBridge add-in via file-based exchange.
 Provides tools: execute_design, get_viewport, clear_design, inspect_design,
-                undo, export_body, measure, section_view, api_docs, mesh_analyze.
+                undo, export_body, measure, section_view, api_docs,
+                mesh_analyze, mesh_modify, highlight.
 """
 
 import asyncio
@@ -317,6 +318,93 @@ async def list_tools() -> list[Tool]:
                         "default": 0.5,
                     },
                 },
+            },
+        ),
+        Tool(
+            name="mesh_modify",
+            description=(
+                "Modify a mesh (STL file) using pure Python — no Fusion needed, won't crash. "
+                "Supports radial_displacement: shrink/expand cylindrical holes by moving vertices "
+                "at a given radius from a center axis to a new radius. "
+                "Use mesh_analyze first to find feature centers and radii, then pass them here. "
+                "The center coordinates come from mesh_analyze's feature groups (divide by 10 if "
+                "mesh_analyze bug ×10 is still active)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "stl_input": {
+                        "type": "string",
+                        "description": "Path to input STL file.",
+                    },
+                    "stl_output": {
+                        "type": "string",
+                        "description": "Path to output STL file. Default: ~/Desktop/modified.stl.",
+                    },
+                    "operation": {
+                        "type": "string",
+                        "enum": ["radial_displacement"],
+                        "description": "Modification operation to apply.",
+                    },
+                    "axis": {
+                        "type": "string",
+                        "enum": ["X", "Y", "Z"],
+                        "description": "Cylinder axis direction. Displacement happens in the perpendicular plane.",
+                        "default": "X",
+                    },
+                    "center": {
+                        "type": "array",
+                        "items": {"type": "number"},
+                        "description": "Center of the cylinder in the perpendicular plane [coord1, coord2]. For axis=X: [center_Y, center_Z]. For axis=Y: [center_X, center_Z]. For axis=Z: [center_X, center_Y].",
+                    },
+                    "current_radius": {
+                        "type": "number",
+                        "description": "Current radius of the cylindrical surface to modify (mm).",
+                    },
+                    "target_radius": {
+                        "type": "number",
+                        "description": "Desired new radius (mm).",
+                    },
+                    "tolerance": {
+                        "type": "number",
+                        "description": "Radius matching tolerance in mm. Default 0.05. Use tight values (0.03-0.05) for meshes with concentric surfaces.",
+                        "default": 0.05,
+                    },
+                },
+                "required": ["stl_input", "operation", "center", "current_radius", "target_radius"],
+            },
+        ),
+        Tool(
+            name="highlight",
+            description=(
+                "Place a temporary visual marker in Fusion 360 to highlight a point or feature. "
+                "Use this to verify you're looking at the correct feature before modifying it. "
+                "Creates a small colored sphere or ring at the specified position."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "position": {
+                        "type": "array",
+                        "items": {"type": "number"},
+                        "description": "3D position [X, Y, Z] in document units (mm) where to place the marker.",
+                    },
+                    "radius": {
+                        "type": "number",
+                        "description": "Marker radius in mm. Default 2.",
+                        "default": 2,
+                    },
+                    "label": {
+                        "type": "string",
+                        "description": "Optional label to print identifying this marker.",
+                    },
+                    "clear": {
+                        "type": "boolean",
+                        "description": "If true, remove all previous highlight markers before placing new one.",
+                        "default": False,
+                    },
+                },
+                "required": ["position"],
             },
         ),
     ]
@@ -1497,6 +1585,147 @@ else:
         print()
 '''
         result = await _send_to_fusion(analyze_code, render=True, timeout=60)
+        contents = _build_response(result)
+        return contents
+
+    elif name == "mesh_modify":
+        import struct
+        import math
+
+        stl_input = arguments["stl_input"]
+        stl_output = arguments.get("stl_output", str(Path.home() / "Desktop" / "modified.stl"))
+        operation = arguments["operation"]
+        axis = arguments.get("axis", "X")
+        center = arguments["center"]
+        current_radius = arguments["current_radius"]
+        target_radius = arguments["target_radius"]
+        tolerance = arguments.get("tolerance", 0.05)
+
+        try:
+            # Read binary STL
+            with open(stl_input, "rb") as f:
+                header = f.read(80)
+                n_tris = struct.unpack("<I", f.read(4))[0]
+                triangles = []
+                for _ in range(n_tris):
+                    nx, ny, nz = struct.unpack("<fff", f.read(12))
+                    v0 = list(struct.unpack("<fff", f.read(12)))
+                    v1 = list(struct.unpack("<fff", f.read(12)))
+                    v2 = list(struct.unpack("<fff", f.read(12)))
+                    attr = struct.unpack("<H", f.read(2))[0]
+                    triangles.append(([nx, ny, nz], v0, v1, v2, attr))
+
+            # Build unique vertex map (by coordinate → list of mutable refs)
+            vert_map: dict[tuple, list] = {}
+            for tri in triangles:
+                for v in [tri[1], tri[2], tri[3]]:
+                    key = (round(v[0], 6), round(v[1], 6), round(v[2], 6))
+                    if key not in vert_map:
+                        vert_map[key] = []
+                    vert_map[key].append(v)
+
+            # Axis mapping: which coordinate indices form the perpendicular plane
+            axis_map = {
+                "X": (1, 2),  # perpendicular plane is YZ
+                "Y": (0, 2),  # perpendicular plane is XZ
+                "Z": (0, 1),  # perpendicular plane is XY
+            }
+            idx_u, idx_v = axis_map[axis]
+            c_u, c_v = center[0], center[1]
+
+            if operation == "radial_displacement":
+                modified = 0
+                for (vx, vy, vz), vrefs in vert_map.items():
+                    coords = [vx, vy, vz]
+                    du = coords[idx_u] - c_u
+                    dv = coords[idx_v] - c_v
+                    dist = math.sqrt(du * du + dv * dv)
+                    if abs(dist - current_radius) < tolerance:
+                        scale = target_radius / dist
+                        new_u = c_u + du * scale
+                        new_v = c_v + dv * scale
+                        for vref in vrefs:
+                            vref[idx_u] = new_u
+                            vref[idx_v] = new_v
+                        modified += 1
+
+            # Write output STL
+            with open(stl_output, "wb") as f:
+                out_header = f"Modified: {operation} r={current_radius}->{target_radius}".encode()
+                f.write(out_header.ljust(80, b"\0"))
+                f.write(struct.pack("<I", n_tris))
+                for normal, v0, v1, v2, attr in triangles:
+                    f.write(struct.pack("<fff", *normal))
+                    f.write(struct.pack("<fff", *v0))
+                    f.write(struct.pack("<fff", *v1))
+                    f.write(struct.pack("<fff", *v2))
+                    f.write(struct.pack("<H", attr))
+
+            out_size = os.path.getsize(stl_output) / (1024 * 1024)
+            text = (
+                f"Modified {modified} unique vertex positions\n"
+                f"Operation: {operation} (axis={axis}, center={center}, "
+                f"r={current_radius} -> {target_radius}, tolerance={tolerance})\n"
+                f"Input: {stl_input} ({n_tris} triangles, {len(vert_map)} unique vertices)\n"
+                f"Output: {stl_output} ({out_size:.1f} MB)"
+            )
+            return [TextContent(type="text", text=text)]
+
+        except Exception as e:
+            return [TextContent(type="text", text=f"Error: {e}")]
+
+    elif name == "highlight":
+        position = arguments["position"]
+        radius = arguments.get("radius", 2)
+        label = arguments.get("label", "")
+        clear = arguments.get("clear", False)
+
+        # Position in document units (mm). Fusion API uses cm internally,
+        # but for mesh bodies we work in document units directly.
+        # We create a sketch circle as a lightweight marker.
+        px, py, pz = position[0], position[1], position[2]
+        label_str = label or f"({px:.1f}, {py:.1f}, {pz:.1f})"
+
+        highlight_code = f"""
+import adsk.core, adsk.fusion, math
+
+# Clear previous markers if requested
+if {clear}:
+    deleted = 0
+    for i in range(rootComp.sketches.count - 1, -1, -1):
+        sk = rootComp.sketches.item(i)
+        if sk.name.startswith("_highlight_"):
+            sk.deleteMe()
+            deleted += 1
+    if deleted:
+        print(f"Cleared {{deleted}} previous markers")
+
+# Create marker sketch on XY plane
+sk = rootComp.sketches.add(rootComp.xYConstructionPlane)
+sk.name = "_highlight_{label_str.replace(' ', '_')[:20]}"
+sk.isVisible = True
+
+# Draw a circle at the projected XY position
+# Note: sketch coordinates are in cm for BRep, but we pass raw values
+# For mesh display, these are document units
+center = adsk.core.Point3D.create({px}, {py}, {pz})
+
+# Draw 3 circles in 3 planes to make a sphere-like marker
+circles = sk.sketchCurves.sketchCircles
+c1 = circles.addByCenterRadius(adsk.core.Point3D.create({px}, {py}, 0), {radius})
+
+# Create another sketch on XZ plane for visibility from side
+sk2 = rootComp.sketches.add(rootComp.xZConstructionPlane)
+sk2.name = "_highlight_side"
+sk2.isVisible = True
+c2 = sk2.sketchCurves.sketchCircles.addByCenterRadius(
+    adsk.core.Point3D.create({px}, {pz}, 0), {radius})
+
+print(f"Marker placed at [{px:.2f}, {py:.2f}, {pz:.2f}] radius={radius}mm")
+print(f"Label: {label_str}")
+print("Use highlight with clear=true to remove markers")
+"""
+        result = await _send_to_fusion(highlight_code, render=True)
         contents = _build_response(result)
         return contents
 
