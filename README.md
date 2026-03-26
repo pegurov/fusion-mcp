@@ -33,7 +33,7 @@ The `execute_design` script context has these globals: `app`, `ui`, `design`, `r
 | Tool | Description |
 |------|-------------|
 | `mesh_analyze` | Reverse-engineer mesh bodies (STL/OBJ): detect holes, circular features, surface segmentation. Returns compact summary instead of raw triangle data |
-| `mesh_modify` | Modify STL files via pure Python (no Fusion needed). Supports `radial_displacement` to shrink/expand cylindrical holes |
+| `mesh_modify` | Modify STL files via pure Python (no Fusion needed). Supports `radial_displacement` (cylindrical holes) and `planar_shift` (flat walls) |
 | `highlight` | Place visual markers on the model to verify feature identification before modifying |
 | `api_docs` | Search Fusion 360 API via live introspection — discover classes, methods, properties |
 
@@ -44,7 +44,7 @@ The `execute_design` script context has these globals: `app`, `ui`, `design`, `r
 | `undo` | Undo last N timeline operations, or rollback to a specific timeline index |
 | `export_body` | Export a body as STL (high/medium/low refinement) for 3D printing |
 | `measure` | Measure body dimensions, volume, area. Gap analysis between two bodies |
-| `section_view` | Create a section plane on X/Y/Z axis at a given offset for inspecting internals |
+| `section_view` | Create a section plane on X/Y/Z axis at a given offset for inspecting internals. Supports `focus_point` for auto-zoom |
 
 #### Examples
 
@@ -64,6 +64,9 @@ measure(body_name="External Frame", body_name_2="Insert Bottom")
 # Section view at Y=0 to see internal holes
 section_view(axis="y", offset=0)
 
+# Section view focused on battery compartment
+section_view(axis="y", offset=1.1, focus_point=[10, 11, 4], view_extent=3)
+
 # Analyze a mesh body — find holes, features, surfaces
 mesh_analyze(min_radius=2, min_circularity=0.7)
 
@@ -76,6 +79,17 @@ mesh_modify(
     center=[40.8, 4.2],    # YZ center from mesh_analyze
     current_radius=3.1,
     target_radius=3.0,
+    tolerance=0.05
+)
+
+# Modify STL: narrow a rectangular slot from 10.5mm to 10mm
+mesh_modify(
+    stl_input="~/Desktop/car.stl",
+    stl_output="~/Desktop/car_narrowed.stl",
+    operation="planar_shift",
+    axis="X",
+    coordinate_value=4.7,   # current wall position (mm)
+    target_value=4.95,       # new wall position (mm)
     tolerance=0.05
 )
 

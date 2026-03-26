@@ -2,8 +2,9 @@
 Fusion 360 MCP Server
 Communicates with FusionMCPBridge add-in via file-based exchange.
 Provides tools: execute_design, get_viewport, clear_design, inspect_design,
-                undo, export_body, measure, section_view, api_docs,
-                mesh_analyze, mesh_modify, highlight.
+                undo, export_body, measure, section_view (with focus_point),
+                api_docs, mesh_analyze, mesh_modify (radial_displacement +
+                planar_shift), highlight.
 """
 
 import asyncio
@@ -236,7 +237,8 @@ async def list_tools() -> list[Tool]:
             description=(
                 "Create a section view of the design by cutting it with a plane. "
                 "Useful for inspecting internal features like holes, recesses, and wall thickness. "
-                "The section is temporary (analysis only, does not modify the design)."
+                "The section is temporary (analysis only, does not modify the design). "
+                "Use focus_point to zoom into a specific area of the section."
             ),
             inputSchema={
                 "type": "object",
@@ -251,6 +253,15 @@ async def list_tools() -> list[Tool]:
                         "type": "number",
                         "description": "Offset of the section plane along the axis in cm. Default 0.",
                         "default": 0,
+                    },
+                    "focus_point": {
+                        "type": "array",
+                        "items": {"type": "number"},
+                        "description": "Optional [X, Y, Z] in mm to center the camera on. Zooms into this area for close-up inspection.",
+                    },
+                    "view_extent": {
+                        "type": "number",
+                        "description": "Camera view extent in cm (zoom level). Smaller = closer. Default auto-fit.",
                     },
                 },
             },
@@ -329,11 +340,11 @@ async def list_tools() -> list[Tool]:
             name="mesh_modify",
             description=(
                 "Modify a mesh (STL file) using pure Python — no Fusion needed, won't crash. "
-                "Supports radial_displacement: shrink/expand cylindrical holes by moving vertices "
-                "at a given radius from a center axis to a new radius. "
-                "Use mesh_analyze first to find feature centers and radii, then pass them here. "
-                "The center coordinates come from mesh_analyze's feature groups (divide by 10 if "
-                "mesh_analyze bug ×10 is still active)."
+                "Operations:\n"
+                "  radial_displacement: shrink/expand cylindrical holes by moving vertices "
+                "at a given radius from a center axis to a new radius.\n"
+                "  planar_shift: move flat wall vertices from one coordinate to another along an axis. "
+                "Use to widen/narrow rectangular slots, adjust wall positions, etc."
             ),
             inputSchema={
                 "type": "object",
@@ -348,35 +359,43 @@ async def list_tools() -> list[Tool]:
                     },
                     "operation": {
                         "type": "string",
-                        "enum": ["radial_displacement"],
+                        "enum": ["radial_displacement", "planar_shift"],
                         "description": "Modification operation to apply.",
                     },
                     "axis": {
                         "type": "string",
                         "enum": ["X", "Y", "Z"],
-                        "description": "Cylinder axis direction. Displacement happens in the perpendicular plane.",
+                        "description": "For radial_displacement: cylinder axis. For planar_shift: axis perpendicular to the wall.",
                         "default": "X",
                     },
                     "center": {
                         "type": "array",
                         "items": {"type": "number"},
-                        "description": "Center of the cylinder in the perpendicular plane [coord1, coord2]. For axis=X: [center_Y, center_Z]. For axis=Y: [center_X, center_Z]. For axis=Z: [center_X, center_Y].",
+                        "description": "radial_displacement only: center in the perpendicular plane [coord1, coord2].",
                     },
                     "current_radius": {
                         "type": "number",
-                        "description": "Current radius of the cylindrical surface to modify (mm).",
+                        "description": "radial_displacement only: current radius of the cylindrical surface (mm).",
                     },
                     "target_radius": {
                         "type": "number",
-                        "description": "Desired new radius (mm).",
+                        "description": "radial_displacement only: desired new radius (mm).",
+                    },
+                    "coordinate_value": {
+                        "type": "number",
+                        "description": "planar_shift only: current coordinate of the wall along the axis (mm).",
+                    },
+                    "target_value": {
+                        "type": "number",
+                        "description": "planar_shift only: desired new coordinate for the wall (mm).",
                     },
                     "tolerance": {
                         "type": "number",
-                        "description": "Radius matching tolerance in mm. Default 0.05. Use tight values (0.03-0.05) for meshes with concentric surfaces.",
+                        "description": "Matching tolerance in mm. Default 0.05.",
                         "default": 0.05,
                     },
                 },
-                "required": ["stl_input", "operation", "center", "current_radius", "target_radius"],
+                "required": ["stl_input", "operation"],
             },
         ),
         Tool(
@@ -828,6 +847,8 @@ else:
     elif name == "section_view":
         axis = arguments.get("axis", "y")
         offset = arguments.get("offset", 0)
+        focus_point = arguments.get("focus_point", None)
+        view_extent = arguments.get("view_extent", None)
 
         axis_map = {
             "x": ("rootComp.yZConstructionPlane", offset),
@@ -836,11 +857,27 @@ else:
         }
         plane_ref, off = axis_map.get(axis, axis_map["y"])
 
+        # Camera target: focus_point (mm -> cm) or auto
+        if focus_point:
+            fp_cm = [focus_point[0] / 10.0, focus_point[1] / 10.0, focus_point[2] / 10.0]
+            target_code = f"adsk.core.Point3D.create({fp_cm[0]}, {fp_cm[1]}, {fp_cm[2]})"
+        else:
+            target_code = "adsk.core.Point3D.create(0, 0, 0.75)"
+
+        # Camera distance from target
+        cam_dist = 15  # cm
+
+        extent_code = ""
+        if view_extent:
+            extent_code = f"""
+_cam.isFitView = False
+_cam.viewExtents = {view_extent}
+"""
+        else:
+            extent_code = "_cam.isFitView = True"
+
         section_code = f"""
 import adsk.core, adsk.fusion
-
-# Create or reuse section analysis
-analyses = rootComp.features.sectionAnalyses if hasattr(rootComp.features, 'sectionAnalyses') else None
 
 # Use construction plane with offset
 ref_plane = {plane_ref}
@@ -849,30 +886,30 @@ plane_input = rootComp.constructionPlanes.createInput()
 plane_input.setByOffset(ref_plane, offset_val)
 section_plane = rootComp.constructionPlanes.add(plane_input)
 
-# Set camera to look along the section axis for a clear view
+# Set camera to look along the section axis
 _vp = app.activeViewport
 _cam = _vp.camera
-_cam.isFitView = True
 _cam.isSmoothTransition = False
 
+_target = {target_code}
 axis = "{axis}"
 if axis == "x":
-    _cam.eye = adsk.core.Point3D.create(30, 0, 5)
-    _cam.target = adsk.core.Point3D.create(0, 0, 0.75)
+    _cam.eye = adsk.core.Point3D.create(_target.x + {cam_dist}, _target.y, _target.z)
 elif axis == "y":
-    _cam.eye = adsk.core.Point3D.create(0, 30, 5)
-    _cam.target = adsk.core.Point3D.create(0, 0, 0.75)
+    _cam.eye = adsk.core.Point3D.create(_target.x, _target.y + {cam_dist}, _target.z)
 else:
-    _cam.eye = adsk.core.Point3D.create(15, 15, 30)
-    _cam.target = adsk.core.Point3D.create(0, 0, 0.75)
+    _cam.eye = adsk.core.Point3D.create(_target.x, _target.y, _target.z + {cam_dist})
+_cam.target = _target
 _cam.upVector = adsk.core.Vector3D.create(0, 0, 1)
+{extent_code}
 _vp.camera = _cam
-_vp.fit()
+if {view_extent is None}:
+    _vp.fit()
 adsk.doEvents()
 
 print(f"Section plane created on {{axis.upper()}} axis at offset {{{off}*10:.1f}}mm")
-print("Note: Enable Section Analysis in Fusion UI (INSPECT > Section Analysis) using this plane.")
-print("The construction plane has been created — select it for section analysis.")
+focus_info = "{f'Focus: [{focus_point[0]}, {focus_point[1]}, {focus_point[2]}] mm' if focus_point else 'Auto-fit view'}"
+print(focus_info)
 """
         result = await _send_to_fusion(section_code, render=True)
         contents = _build_response(result)
@@ -1040,10 +1077,11 @@ else:
         stl_output = arguments.get("stl_output", str(Path.home() / "Desktop" / "modified.stl"))
         operation = arguments["operation"]
         axis = arguments.get("axis", "X")
-        center = arguments["center"]
-        current_radius = arguments["current_radius"]
-        target_radius = arguments["target_radius"]
         tolerance = arguments.get("tolerance", 0.05)
+        # radial_displacement params
+        center = arguments.get("center", [0, 0])
+        current_radius = arguments.get("current_radius", 0)
+        target_radius = arguments.get("target_radius", 0)
 
         try:
             # Read binary STL
@@ -1093,9 +1131,27 @@ else:
                             vref[idx_v] = new_v
                         modified += 1
 
+            elif operation == "planar_shift":
+                coordinate_value = arguments["coordinate_value"]
+                target_value_op = arguments["target_value"]
+                # Axis index: X=0, Y=1, Z=2
+                axis_idx = {"X": 0, "Y": 1, "Z": 2}[axis]
+                modified = 0
+                for (vx, vy, vz), vrefs in vert_map.items():
+                    coords = [vx, vy, vz]
+                    if abs(coords[axis_idx] - coordinate_value) < tolerance:
+                        for vref in vrefs:
+                            vref[axis_idx] = target_value_op
+                        modified += 1
+
             # Write output STL
             with open(stl_output, "wb") as f:
-                out_header = f"Modified: {operation} r={current_radius}->{target_radius}".encode()
+                if operation == "radial_displacement":
+                    out_header = f"Modified: {operation} r={current_radius}->{target_radius}".encode()
+                else:
+                    cv = arguments.get("coordinate_value", 0)
+                    tv = arguments.get("target_value", 0)
+                    out_header = f"Modified: {operation} {axis}={cv}->{tv}".encode()
                 f.write(out_header.ljust(80, b"\0"))
                 f.write(struct.pack("<I", n_tris))
                 for normal, v0, v1, v2, attr in triangles:
@@ -1106,10 +1162,15 @@ else:
                     f.write(struct.pack("<H", attr))
 
             out_size = os.path.getsize(stl_output) / (1024 * 1024)
+            if operation == "radial_displacement":
+                op_detail = f"axis={axis}, center={center}, r={current_radius} -> {target_radius}"
+            else:
+                cv = arguments.get("coordinate_value", 0)
+                tv = arguments.get("target_value", 0)
+                op_detail = f"axis={axis}, {cv} -> {tv}"
             text = (
                 f"Modified {modified} unique vertex positions\n"
-                f"Operation: {operation} (axis={axis}, center={center}, "
-                f"r={current_radius} -> {target_radius}, tolerance={tolerance})\n"
+                f"Operation: {operation} ({op_detail}, tolerance={tolerance})\n"
                 f"Input: {stl_input} ({n_tris} triangles, {len(vert_map)} unique vertices)\n"
                 f"Output: {stl_output} ({out_size:.1f} MB)"
             )
