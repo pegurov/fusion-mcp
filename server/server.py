@@ -4,7 +4,7 @@ Communicates with FusionMCPBridge add-in via file-based exchange.
 Provides tools: execute_design, get_viewport, clear_design, inspect_design,
                 undo, export_body, measure, section_view (with focus_point),
                 api_docs, mesh_analyze, mesh_modify (radial_displacement +
-                planar_shift), highlight.
+                planar_shift), highlight, import_mesh.
 """
 
 import asyncio
@@ -429,6 +429,33 @@ async def list_tools() -> list[Tool]:
                     },
                 },
                 "required": ["position"],
+            },
+        ),
+        Tool(
+            name="import_mesh",
+            description=(
+                "Import an STL file into the active Fusion 360 design as a mesh body. "
+                "Parses binary STL, deduplicates vertices, converts mm→cm, and loads via addByTriangleMeshData. "
+                "Much faster than writing STL-parsing code via execute_design every time."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "stl_path": {
+                        "type": "string",
+                        "description": "Path to the STL file to import.",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Name for the imported mesh body. Default: filename without extension.",
+                    },
+                    "scale": {
+                        "type": "number",
+                        "description": "Scale factor. Default 1.0 (assumes STL is in mm).",
+                        "default": 1.0,
+                    },
+                },
+                "required": ["stl_path"],
             },
         ),
     ]
@@ -1248,6 +1275,70 @@ print("Camera pointed at marker. Use clear=true to remove.")
         result = await _send_to_fusion(highlight_code, render=True)
         contents = _build_response(result)
         return contents
+
+    elif name == "import_mesh":
+        stl_path = os.path.expanduser(arguments["stl_path"])
+        body_name = arguments.get("name", "")
+        scale = arguments.get("scale", 1.0)
+
+        if not body_name:
+            body_name = os.path.splitext(os.path.basename(stl_path))[0]
+
+        # Parse binary STL on the server side
+        import struct as _struct
+
+        if not os.path.exists(stl_path):
+            return [TextContent(type="text", text=f"File not found: {stl_path}")]
+
+        with open(stl_path, "rb") as f:
+            _header = f.read(80)
+            num_triangles = _struct.unpack("<I", f.read(4))[0]
+
+            vertex_map = {}
+            coords = []
+            normals = []
+            indices = []
+            vertex_idx = 0
+
+            for _ in range(num_triangles):
+                data = _struct.unpack("<12fH", f.read(50))
+                nx, ny, nz = data[0], data[1], data[2]
+
+                for v in range(3):
+                    vx = data[3 + v * 3]
+                    vy = data[4 + v * 3]
+                    vz = data[5 + v * 3]
+
+                    key = (round(vx, 5), round(vy, 5), round(vz, 5))
+                    if key not in vertex_map:
+                        vertex_map[key] = vertex_idx
+                        # STL mm → Fusion cm, apply scale
+                        coords.extend([vx * scale / 10.0, vy * scale / 10.0, vz * scale / 10.0])
+                        normals.extend([nx, ny, nz])
+                        vertex_idx += 1
+                    indices.append(vertex_map[key])
+
+        # Generate Fusion code with embedded data
+        import_code = f"""
+import adsk.core, adsk.fusion
+
+coords = {coords}
+indices = {indices}
+normals = {normals}
+
+meshBody = rootComp.meshBodies.addByTriangleMeshData(coords, indices, normals, [])
+meshBody.name = "{body_name}"
+
+viewport = app.activeViewport
+viewport.fit()
+
+print(f"Imported: {{meshBody.name}}")
+print(f"  Vertices: {vertex_idx:,}")
+print(f"  Triangles: {num_triangles:,}")
+print(f"  Mesh bodies total: {{rootComp.meshBodies.count}}")
+"""
+        result = await _send_to_fusion(import_code, render=True, timeout=120)
+        return _build_response(result)
 
     else:
         return [TextContent(type="text", text=f"Unknown tool: {name}")]

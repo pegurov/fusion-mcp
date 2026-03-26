@@ -32,6 +32,7 @@ The `execute_design` script context has these globals: `app`, `ui`, `design`, `r
 
 | Tool | Description |
 |------|-------------|
+| `import_mesh` | Import STL file into Fusion as a mesh body. Parses binary STL, deduplicates vertices, handles mm→cm conversion automatically |
 | `mesh_analyze` | Reverse-engineer mesh bodies (STL/OBJ): detect holes, circular features, surface segmentation. Returns compact summary instead of raw triangle data |
 | `mesh_modify` | Modify STL files via pure Python (no Fusion needed). Supports `radial_displacement` (cylindrical holes) and `planar_shift` (flat walls) |
 | `highlight` | Place visual markers on the model to verify feature identification before modifying |
@@ -66,6 +67,12 @@ section_view(axis="y", offset=0)
 
 # Section view focused on battery compartment
 section_view(axis="y", offset=1.1, focus_point=[10, 11, 4], view_extent=3)
+
+# Import an STL file into Fusion
+import_mesh(stl_path="~/Desktop/rc_car.stl")
+
+# Import with custom name and scale
+import_mesh(stl_path="~/Desktop/part.stl", name="chassis", scale=0.5)
 
 # Analyze a mesh body — find holes, features, surfaces
 mesh_analyze(min_radius=2, min_circularity=0.7)
