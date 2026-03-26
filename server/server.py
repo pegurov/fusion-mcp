@@ -297,8 +297,10 @@ async def list_tools() -> list[Tool]:
             name="mesh_analyze",
             description=(
                 "Analyze a mesh body (STL file or Fusion mesh) without flooding the context. "
-                "Returns: bounding box, triangle/vertex count, detected features (holes, circular openings), "
-                "and surface segmentation by normal direction. "
+                "Returns: bounding box, triangle/vertex count, surface segmentation, "
+                "cylindrical features (holes/tubes via curvature analysis — works on watertight meshes), "
+                "flat walls (with coordinates for planar_shift), cross-section scan (through-holes & channels), "
+                "and feature relationships (distances between cylinders). "
                 "Prefer stl_path for direct STL analysis (faster, no Fusion needed). "
                 "Use body_name only when the mesh is already loaded in Fusion and not saved as STL."
             ),
@@ -1613,6 +1615,391 @@ def _mesh_analyze_stl(
                 })
         else:
             lines.append("  Watertight mesh — no open boundaries")
+
+            # --- Curvature-based cylinder detection for watertight meshes ---
+            # For each major axis, find triangles with normals perpendicular to it
+            # (cylindrical surfaces). Cluster by estimated center → fit circles.
+            axis_labels = [("Z", 0, 1, 2), ("X", 1, 2, 0), ("Y", 0, 2, 1)]
+            perp_thresh = 0.2  # |n_axis| < this → normal is perpendicular to axis
+            all_cylinders: list[dict] = []
+
+            for axis_name, u_idx, v_idx, ax_idx in axis_labels:
+                # Collect triangles with normals perpendicular to this axis
+                cyl_tris = []
+                for si in range(0, tri_count, max(1, tri_count // min(tri_count, sample_size * 2))):
+                    n = tri_normals[si]
+                    if abs(n[ax_idx]) > perp_thresh:
+                        continue
+                    # Normal is roughly perpendicular to this axis
+                    v0, v1, v2 = tri_verts[si]
+                    cx = (v0[u_idx] + v1[u_idx] + v2[u_idx]) / 3
+                    cy = (v0[v_idx] + v1[v_idx] + v2[v_idx]) / 3
+                    cz = (v0[ax_idx] + v1[ax_idx] + v2[ax_idx]) / 3
+                    # Normal in the perpendicular plane
+                    nu = n[u_idx]
+                    nv = n[v_idx]
+                    nlen = math.sqrt(nu**2 + nv**2)
+                    if nlen < 0.3:
+                        continue
+                    nu /= nlen
+                    nv /= nlen
+                    cyl_tris.append((cx, cy, cz, nu, nv))
+
+                if len(cyl_tris) < 10:
+                    continue
+
+                # Estimate cylinder centers: for a cylinder surface, the center is at
+                # centroid - normal * radius. Since we don't know radius, we use the fact
+                # that all normals from the same cylinder point away from the same center.
+                # Strategy: vote for centers using pairs of nearby triangles.
+                # Simpler: bin centroids by (u, v) position and find clusters with
+                # consistent radial normals.
+
+                # Grid-based clustering of centroids
+                grid_size = max(bb_size) / 40  # adaptive grid
+                if grid_size < 0.5:
+                    grid_size = 0.5
+                cell_data: dict[tuple, list] = {}
+                for cx, cy, cz, nu, nv in cyl_tris:
+                    key = (round(cx / grid_size), round(cy / grid_size))
+                    cell_data.setdefault(key, []).append((cx, cy, cz, nu, nv))
+
+                # Find cells that form circular patterns: for each group of cells,
+                # compute the center they point toward
+                # Use RANSAC-like approach: sample pairs, compute center, count inliers
+                import random
+                random.seed(42)
+                best_centers: list[tuple] = []  # (center_u, center_v, radius, inlier_count, z_min, z_max)
+
+                flat_pts = cyl_tris
+                n_samples = min(len(flat_pts), 500)
+                tried_centers: set[tuple] = set()
+
+                for _ in range(n_samples):
+                    # Pick a random triangle
+                    p = flat_pts[random.randint(0, len(flat_pts) - 1)]
+                    cx, cy, cz, nu, nv = p
+
+                    # Try different radii
+                    for r_try in [r / 10.0 for r in range(
+                        max(1, int(min_radius * 10)),
+                        min(int(max(bb_size) * 5), 200),
+                        max(1, int(min_radius * 5))
+                    )]:
+                        # Estimated center (normal points outward from center)
+                        est_cu = cx - nu * r_try
+                        est_cv = cy - nv * r_try
+                        # Quantize to avoid duplicates
+                        qkey = (round(est_cu, 1), round(est_cv, 1), round(r_try, 1))
+                        if qkey in tried_centers:
+                            continue
+                        tried_centers.add(qkey)
+
+                        # Count inliers: points at distance r_try ± tolerance from this center
+                        # whose normal points away from center
+                        tol = max(r_try * 0.1, 0.15)
+                        inliers = 0
+                        z_vals = []
+                        for px, py, pz, pnu, pnv in flat_pts:
+                            dist = math.sqrt((px - est_cu)**2 + (py - est_cv)**2)
+                            if abs(dist - r_try) > tol:
+                                continue
+                            # Check normal consistency: should point away from center
+                            dx = px - est_cu
+                            dy = py - est_cv
+                            dlen = math.sqrt(dx**2 + dy**2)
+                            if dlen < 0.01:
+                                continue
+                            dot = (dx / dlen) * pnu + (dy / dlen) * pnv
+                            if dot > 0.5:  # normal points outward (hole inner surface points inward: dot < -0.5)
+                                inliers += 1
+                                z_vals.append(pz)
+                            elif dot < -0.5:  # inward normal (inner surface of hole)
+                                inliers += 1
+                                z_vals.append(pz)
+
+                        if inliers >= 12:
+                            z_vals.sort()
+                            best_centers.append((est_cu, est_cv, r_try, inliers,
+                                                 z_vals[0], z_vals[-1]))
+
+                # Deduplicate and rank centers
+                best_centers.sort(key=lambda c: -c[3])
+                deduped_cyls = []
+                for cu, cv, r, count, zmin, zmax in best_centers:
+                    too_close = False
+                    for dcu, dcv, dr, _, _, _ in deduped_cyls:
+                        if math.sqrt((cu - dcu)**2 + (cv - dcv)**2) < max(r, dr) * 0.5:
+                            too_close = True
+                            break
+                    if not too_close and count >= 12:
+                        deduped_cyls.append((cu, cv, r, count, zmin, zmax))
+
+                for cu, cv, r, count, zmin, zmax in deduped_cyls[:10]:
+                    if r < min_radius:
+                        continue
+                    # Build center_3d based on axis
+                    if axis_name == "Z":
+                        center_3d = [round(cu, 2), round(cv, 2), round((zmin + zmax) / 2, 2)]
+                    elif axis_name == "X":
+                        center_3d = [round((zmin + zmax) / 2, 2), round(cu, 2), round(cv, 2)]
+                    else:
+                        center_3d = [round(cu, 2), round((zmin + zmax) / 2, 2), round(cv, 2)]
+
+                    all_cylinders.append({
+                        "axis": axis_name,
+                        "center_mm": center_3d,
+                        "radius_mm": round(r, 2),
+                        "diameter_mm": round(r * 2, 2),
+                        "height_mm": round(zmax - zmin, 1),
+                        "inliers": count,
+                        "z_range": [round(zmin, 1), round(zmax, 1)],
+                    })
+
+            if all_cylinders:
+                all_cylinders.sort(key=lambda c: (-c["inliers"], -c["radius_mm"]))
+                # Filter by min_radius and take top results
+                all_cylinders = [c for c in all_cylinders if c["radius_mm"] >= min_radius][:15]
+
+                lines.append(f"\n  Detected {len(all_cylinders)} cylindrical features (curvature-based):\n")
+                lines.append(f"  {'#':>3} | {'Axis':>4} | {'Diam mm':>8} | {'Radius':>7} | {'Height':>7} | {'Inliers':>7} | Center (mm)")
+                lines.append("  " + "-" * 85)
+                for ci, cyl in enumerate(all_cylinders):
+                    cx, cy, cz = cyl["center_mm"]
+                    lines.append(
+                        f"  {ci+1:>3} | {cyl['axis']:>4} | {cyl['diameter_mm']:>8.1f} | "
+                        f"{cyl['radius_mm']:>7.2f} | {cyl['height_mm']:>7.1f} | "
+                        f"{cyl['inliers']:>7} | [{cx:.1f}, {cy:.1f}, {cz:.1f}]"
+                    )
+
+                for cyl in all_cylinders:
+                    features_json.append({
+                        "type": "cylinder",
+                        "axis": cyl["axis"],
+                        "center_mm": cyl["center_mm"],
+                        "diameter_mm": cyl["diameter_mm"],
+                        "radius_mm": cyl["radius_mm"],
+                        "height_mm": cyl["height_mm"],
+                        "z_range": cyl["z_range"],
+                    })
+
+    # --- Flat wall detection ---
+    if detect_features:
+        flat_thresh = 0.9  # |n_axis| > this → flat surface
+        flat_walls: list[dict] = []
+        axis_names_flat = [("X", 0), ("Y", 1), ("Z", 2)]
+
+        for axis_name, ax_idx in axis_names_flat:
+            # Collect triangles with normals aligned to this axis
+            wall_coords: dict[float, list] = {}  # quantized coordinate → list of (area, centroid)
+            quant = max(bb_size[ax_idx] / 200, 0.05)
+
+            for si in range(0, tri_count, max(1, tri_count // min(tri_count, sample_size * 2))):
+                n = tri_normals[si]
+                if abs(n[ax_idx]) < flat_thresh:
+                    continue
+                v0, v1, v2 = tri_verts[si]
+                coord = (v0[ax_idx] + v1[ax_idx] + v2[ax_idx]) / 3
+                e1 = (v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2])
+                e2 = (v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2])
+                cx = e1[1] * e2[2] - e1[2] * e2[1]
+                cy = e1[2] * e2[0] - e1[0] * e2[2]
+                cz = e1[0] * e2[1] - e1[1] * e2[0]
+                area = 0.5 * math.sqrt(cx**2 + cy**2 + cz**2)
+
+                qcoord = round(coord / quant) * quant
+                centroid = [(v0[i] + v1[i] + v2[i]) / 3 for i in range(3)]
+                wall_coords.setdefault(qcoord, []).append((area, centroid))
+
+            # Merge nearby coordinate clusters
+            sorted_coords = sorted(wall_coords.keys())
+            clusters: list[tuple] = []  # (coord, total_area, bounds)
+            i = 0
+            while i < len(sorted_coords):
+                cluster_coord = sorted_coords[i]
+                total_area = 0.0
+                all_centroids = []
+                j = i
+                while j < len(sorted_coords) and sorted_coords[j] - cluster_coord < quant * 3:
+                    for area, cent in wall_coords[sorted_coords[j]]:
+                        total_area += area
+                        all_centroids.append(cent)
+                    j += 1
+                if total_area > 1.0 and len(all_centroids) >= 3:  # min 1mm² and 3 triangles
+                    other_axes = [k for k in range(3) if k != ax_idx]
+                    bounds = {}
+                    for oa in other_axes:
+                        vals = [c[oa] for c in all_centroids]
+                        bounds[oa] = (min(vals), max(vals))
+                    avg_coord = sum(c[ax_idx] for c in all_centroids) / len(all_centroids)
+                    clusters.append((avg_coord, total_area, bounds, len(all_centroids)))
+                i = j
+
+            for coord, area, bounds, count in clusters:
+                if area < 2.0:  # skip tiny walls
+                    continue
+                other_axes = [k for k in range(3) if k != ax_idx]
+                spans = {k: bounds[k][1] - bounds[k][0] for k in other_axes}
+                flat_walls.append({
+                    "axis": axis_name,
+                    "coordinate_mm": round(coord, 2),
+                    "area_mm2": round(area, 1),
+                    "bounds": {["X", "Y", "Z"][k]: [round(bounds[k][0], 1), round(bounds[k][1], 1)]
+                               for k in other_axes},
+                    "tri_count": count,
+                })
+
+        if flat_walls:
+            flat_walls.sort(key=lambda w: -w["area_mm2"])
+            flat_walls = flat_walls[:20]  # top 20
+            lines.append(f"\n  Flat walls ({len(flat_walls)}):\n")
+            lines.append(f"  {'#':>3} | {'Axis':>4} | {'Coord mm':>9} | {'Area mm²':>9} | Bounds")
+            lines.append("  " + "-" * 75)
+            for wi, w in enumerate(flat_walls):
+                bounds_str = ", ".join(f"{k}=[{v[0]:.1f}..{v[1]:.1f}]" for k, v in w["bounds"].items())
+                lines.append(f"  {wi+1:>3} | {w['axis']:>4} | {w['coordinate_mm']:>9.2f} | {w['area_mm2']:>9.1f} | {bounds_str}")
+
+            for w in flat_walls:
+                features_json.append({"type": "flat_wall", **w})
+
+    # --- Cross-section scan ---
+    if detect_features:
+        lines.append(f"\n  Cross-section scan (through-holes & channels):\n")
+        axis_scan = [("X", 0, 1, 2), ("Y", 1, 0, 2), ("Z", 2, 0, 1)]
+
+        for axis_name, ax_idx, u_idx, v_idx in axis_scan:
+            ax_min, ax_max = bb_min[ax_idx], bb_max[ax_idx]
+            ax_span = ax_max - ax_min
+            if ax_span < 1.0:
+                continue
+
+            # Take slices at 20%, 50%, 80% along axis
+            slice_tol = ax_span * 0.03  # 3% tolerance
+            channels_found = []
+
+            for frac in [0.2, 0.5, 0.8]:
+                slice_pos = ax_min + frac * ax_span
+
+                # Collect vertices near this slice
+                slice_verts_uv = []
+                for vi in range(n_verts):
+                    vx = coords[vi * 3 + ax_idx]
+                    if abs(vx - slice_pos) < slice_tol:
+                        vu = coords[vi * 3 + u_idx]
+                        vv = coords[vi * 3 + v_idx]
+                        slice_verts_uv.append((vu, vv))
+
+                if len(slice_verts_uv) < 5:
+                    continue
+
+                # Build occupancy grid for this slice
+                u_vals = [p[0] for p in slice_verts_uv]
+                v_vals = [p[1] for p in slice_verts_uv]
+                u_min_s, u_max_s = min(u_vals), max(u_vals)
+                v_min_s, v_max_s = min(v_vals), max(v_vals)
+
+                grid_res_scan = max((u_max_s - u_min_s), (v_max_s - v_min_s)) / 50
+                if grid_res_scan < 0.2:
+                    grid_res_scan = 0.2
+
+                occupied_cells: set[tuple] = set()
+                for vu, vv in slice_verts_uv:
+                    gu = int((vu - u_min_s) / grid_res_scan)
+                    gv = int((vv - v_min_s) / grid_res_scan)
+                    occupied_cells.add((gu, gv))
+
+                # Scan rows to find gaps (potential holes)
+                u_axis_name = ["X", "Y", "Z"][u_idx]
+                v_axis_name = ["X", "Y", "Z"][v_idx]
+
+                gv_min = int((v_min_s - v_min_s) / grid_res_scan)
+                gv_max = int((v_max_s - v_min_s) / grid_res_scan)
+                gu_min = int((u_min_s - u_min_s) / grid_res_scan)
+                gu_max = int((u_max_s - u_min_s) / grid_res_scan)
+
+                # Find internal gaps (material-gap-material pattern)
+                gaps_at_slice: list[dict] = []
+                for gv in range(gv_min, gv_max + 1):
+                    row_occupied = sorted([gu for gu in range(gu_min, gu_max + 1) if (gu, gv) in occupied_cells])
+                    if len(row_occupied) < 2:
+                        continue
+                    first, last = row_occupied[0], row_occupied[-1]
+                    for i in range(len(row_occupied) - 1):
+                        gap_start = row_occupied[i]
+                        gap_end = row_occupied[i + 1]
+                        gap_size = gap_end - gap_start - 1
+                        if gap_size >= 2:  # at least 2 grid cells gap
+                            gap_u = u_min_s + (gap_start + gap_end) / 2 * grid_res_scan
+                            gap_v = v_min_s + gv * grid_res_scan
+                            gap_width = gap_size * grid_res_scan
+                            gaps_at_slice.append({
+                                "u": round(gap_u, 1), "v": round(gap_v, 1),
+                                "width": round(gap_width, 1),
+                            })
+
+                # Cluster nearby gaps into channels
+                if gaps_at_slice:
+                    gap_clusters: list[list] = []
+                    used_gaps: set[int] = set()
+                    for gi, g in enumerate(gaps_at_slice):
+                        if gi in used_gaps:
+                            continue
+                        cluster = [g]
+                        used_gaps.add(gi)
+                        for gj, g2 in enumerate(gaps_at_slice):
+                            if gj in used_gaps:
+                                continue
+                            if abs(g["u"] - g2["u"]) < grid_res_scan * 4 and abs(g["v"] - g2["v"]) < grid_res_scan * 4:
+                                cluster.append(g2)
+                                used_gaps.add(gj)
+                        gap_clusters.append(cluster)
+
+                    for gc in gap_clusters:
+                        if len(gc) < 2:
+                            continue
+                        avg_u = sum(g["u"] for g in gc) / len(gc)
+                        avg_v = sum(g["v"] for g in gc) / len(gc)
+                        avg_w = sum(g["width"] for g in gc) / len(gc)
+                        v_spread = max(g["v"] for g in gc) - min(g["v"] for g in gc)
+                        channels_found.append({
+                            "slice_pos": round(slice_pos, 1),
+                            "slice_frac": frac,
+                            "center": {u_axis_name: round(avg_u, 1), v_axis_name: round(avg_v, 1)},
+                            "width_mm": round(avg_w, 1),
+                            "extent_mm": round(v_spread, 1),
+                            "gap_count": len(gc),
+                        })
+
+            if channels_found:
+                lines.append(f"  {axis_name}-axis slices:")
+                for ch in channels_found:
+                    center_str = ", ".join(f"{k}={v}" for k, v in ch["center"].items())
+                    lines.append(
+                        f"    Slice {axis_name}={ch['slice_pos']:.1f} ({ch['slice_frac']:.0%}): "
+                        f"channel at {center_str}, width~{ch['width_mm']:.1f}mm, "
+                        f"extent~{ch['extent_mm']:.1f}mm ({ch['gap_count']} rows)"
+                    )
+                for ch in channels_found:
+                    features_json.append({"type": "channel", "axis": axis_name, **ch})
+
+    # --- Feature relationships ---
+    if detect_features and len(features_json) >= 2:
+        cyl_features = [f for f in features_json if f.get("type") == "cylinder"]
+        if len(cyl_features) >= 2:
+            lines.append(f"\n  Feature relationships:\n")
+            for i in range(len(cyl_features)):
+                for j in range(i + 1, len(cyl_features)):
+                    f1, f2 = cyl_features[i], cyl_features[j]
+                    if f1.get("axis") != f2.get("axis"):
+                        continue
+                    c1, c2 = f1["center_mm"], f2["center_mm"]
+                    dist = math.sqrt(sum((c1[k] - c2[k])**2 for k in range(3)))
+                    gap = dist - f1["radius_mm"] - f2["radius_mm"]
+                    lines.append(
+                        f"    Cyl [{c1[0]:.1f},{c1[1]:.1f},{c1[2]:.1f}] r={f1['radius_mm']:.1f} ↔ "
+                        f"Cyl [{c2[0]:.1f},{c2[1]:.1f},{c2[2]:.1f}] r={f2['radius_mm']:.1f}: "
+                        f"dist={dist:.1f}mm, gap={gap:.1f}mm"
+                    )
 
     if features_json:
         lines.append("\n--- features_json ---")

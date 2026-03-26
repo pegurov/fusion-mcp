@@ -33,7 +33,7 @@ The `execute_design` script context has these globals: `app`, `ui`, `design`, `r
 | Tool | Description |
 |------|-------------|
 | `import_mesh` | Import STL file into Fusion as a mesh body. Parses binary STL, deduplicates vertices, handles mm→cm conversion automatically |
-| `mesh_analyze` | Reverse-engineer mesh bodies (STL/OBJ): detect holes, circular features, surface segmentation. Returns compact summary instead of raw triangle data |
+| `mesh_analyze` | Reverse-engineer mesh bodies: cylindrical features (curvature-based, works on watertight meshes), flat walls, cross-section scan for through-holes/channels, feature relationships, surface segmentation |
 | `mesh_modify` | Modify STL files via pure Python (no Fusion needed). Supports `radial_displacement` (cylindrical holes) and `planar_shift` (flat walls) |
 | `highlight` | Place visual markers on the model to verify feature identification before modifying |
 | `api_docs` | Search Fusion 360 API via live introspection — discover classes, methods, properties |
