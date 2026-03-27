@@ -4,7 +4,7 @@ Communicates with FusionMCPBridge add-in via file-based exchange.
 Provides tools: execute_design, get_viewport, clear_design, inspect_design,
                 undo, export_body, measure, section_view (with focus_point),
                 api_docs, mesh_analyze, mesh_modify (radial_displacement +
-                planar_shift), highlight, import_mesh.
+                planar_shift), highlight, import_mesh, design_to_python.
 """
 
 import asyncio
@@ -458,6 +458,25 @@ async def list_tools() -> list[Tool]:
                     },
                 },
                 "required": ["stl_path"],
+            },
+        ),
+        Tool(
+            name="design_to_python",
+            description=(
+                "Export the current parametric Fusion 360 design as a Python script. "
+                "Rolls through the timeline step by step, inspecting selected profiles, edges, "
+                "and faces IN CONTEXT to capture geometric descriptions (not internal IDs). "
+                "Returns a self-contained Python script that recreates the design from scratch. "
+                "Only works with parametric designs that have a timeline."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "output_path": {
+                        "type": "string",
+                        "description": "Path to save the generated Python script. Default: ~/Desktop/design_export.py.",
+                    },
+                },
             },
         ),
     ]
@@ -1340,6 +1359,294 @@ print(f"  Triangles: {num_triangles:,}")
 print(f"  Mesh bodies total: {{rootComp.meshBodies.count}}")
 """
         result = await _send_to_fusion(import_code, render=True, timeout=120)
+        return _build_response(result)
+
+    elif name == "design_to_python":
+        output_path = arguments.get("output_path", "~/Desktop/design_export.py")
+        output_path = os.path.expanduser(output_path)
+
+        export_code = f'''
+import adsk.core, adsk.fusion, json, math, traceback
+
+output_path = "{output_path}"
+timeline = design.timeline
+tl_count = timeline.count
+
+if design.designType != adsk.fusion.DesignTypes.ParametricDesignType:
+    print("ERROR: Design is not parametric (no timeline)")
+else:
+    steps = []
+
+    # Collect user parameters
+    params = []
+    for pi in range(design.userParameters.count):
+        p = design.userParameters.item(pi)
+        params.append({{"name": p.name, "expression": p.expression, "unit": p.unit,
+                        "value": round(p.value, 6)}})
+
+    # Roll through timeline step by step
+    for ti in range(tl_count):
+        item = timeline.item(ti)
+        entity = item.entity
+        etype = entity.objectType.split("::")[-1]
+        step = {{"index": ti, "name": item.name, "type": etype}}
+
+        try:
+            if isinstance(entity, adsk.fusion.Sketch):
+                sk = entity
+                # Reference plane
+                rp = sk.referencePlane
+                if hasattr(rp, 'name'):
+                    step["plane"] = rp.name
+                elif hasattr(rp, 'objectType'):
+                    ot = rp.objectType.split("::")[-1]
+                    if ot == "BRepFace":
+                        # Describe the face geometrically
+                        try:
+                            g = rp.geometry
+                            if hasattr(g, 'normal'):
+                                n = g.normal
+                                step["plane"] = "face"
+                                step["face_normal"] = [round(n.x,3), round(n.y,3), round(n.z,3)]
+                                bb = rp.boundingBox
+                                step["face_center_z"] = round((bb.minPoint.z + bb.maxPoint.z)/2, 4)
+                                step["face_area"] = round(rp.area, 4)
+                        except:
+                            step["plane"] = "BRepFace"
+                    elif ot == "ConstructionPlane":
+                        step["plane"] = rp.name
+                    else:
+                        step["plane"] = ot
+
+                # Curves
+                curves = []
+                for ci in range(sk.sketchCurves.count):
+                    c = sk.sketchCurves.item(ci)
+                    ct = c.objectType.split("::")[-1]
+                    cd = {{"type": ct, "construction": c.isConstruction}}
+                    if isinstance(c, adsk.fusion.SketchLine):
+                        sp = c.startSketchPoint.geometry
+                        ep = c.endSketchPoint.geometry
+                        cd["start"] = [round(sp.x,4), round(sp.y,4)]
+                        cd["end"] = [round(ep.x,4), round(ep.y,4)]
+                    elif isinstance(c, adsk.fusion.SketchCircle):
+                        cp = c.centerSketchPoint.geometry
+                        cd["center"] = [round(cp.x,4), round(cp.y,4)]
+                        cd["radius"] = round(c.radius, 4)
+                    elif isinstance(c, adsk.fusion.SketchArc):
+                        cp = c.centerSketchPoint.geometry
+                        sp = c.startSketchPoint.geometry
+                        ep = c.endSketchPoint.geometry
+                        cd["center"] = [round(cp.x,4), round(cp.y,4)]
+                        cd["radius"] = round(c.radius, 4)
+                        cd["start"] = [round(sp.x,4), round(sp.y,4)]
+                        cd["end"] = [round(ep.x,4), round(ep.y,4)]
+                    curves.append(cd)
+                step["curves"] = curves
+
+            elif isinstance(entity, adsk.fusion.ExtrudeFeature):
+                ext = entity
+                step["operation"] = int(ext.operation)
+                # Extent
+                e1 = ext.extentOne
+                step["extent_type"] = e1.objectType.split("::")[-1]
+                if hasattr(e1, 'distance'):
+                    step["distance"] = round(e1.distance.value, 4)
+                if ext.extentTwo and hasattr(ext.extentTwo, 'distance'):
+                    step["distance2"] = round(ext.extentTwo.distance.value, 4)
+                step["is_symmetric"] = hasattr(ext, 'isSymmetricExtent') and ext.isSymmetricExtent
+
+                # CRITICAL: Identify selected profiles by geometric properties
+                try:
+                    profiles_info = []
+                    prof = ext.profile
+                    # prof can be a single Profile or ObjectCollection
+                    if hasattr(prof, 'count'):
+                        for pi in range(prof.count):
+                            p = prof.item(pi)
+                            ap = p.areaProperties()
+                            profiles_info.append({{
+                                "area": round(abs(ap.area), 4),
+                                "centroid": [round(ap.centroid.x, 3), round(ap.centroid.y, 3)],
+                            }})
+                    elif hasattr(prof, 'areaProperties'):
+                        ap = prof.areaProperties()
+                        profiles_info.append({{
+                            "area": round(abs(ap.area), 4),
+                            "centroid": [round(ap.centroid.x, 3), round(ap.centroid.y, 3)],
+                        }})
+                    step["profiles"] = profiles_info
+                except Exception as pe:
+                    step["profiles_error"] = str(pe)
+
+                # Body name
+                try:
+                    if ext.bodies.count > 0:
+                        step["body_name"] = ext.bodies.item(0).name
+                except:
+                    pass
+
+                # Start extent type
+                try:
+                    step["start_extent"] = ext.startExtent.objectType.split("::")[-1]
+                except:
+                    pass
+
+            elif isinstance(entity, adsk.fusion.FilletFeature):
+                fil = entity
+                edge_sets = []
+                for esi in range(fil.edgeSets.count):
+                    es = fil.edgeSets.item(esi)
+                    r = round(es.radius.value, 4)
+                    # Describe edges geometrically
+                    edge_descs = []
+                    for ei in range(es.edges.count):
+                        e = es.edges.item(ei)
+                        try:
+                            sp = e.startVertex.geometry
+                            ep = e.endVertex.geometry
+                            gt = e.geometry.objectType.split("::")[-1]
+                            edge_descs.append({{
+                                "geom_type": gt,
+                                "start": [round(sp.x,2), round(sp.y,2), round(sp.z,2)],
+                                "end": [round(ep.x,2), round(ep.y,2), round(ep.z,2)],
+                            }})
+                        except:
+                            pass
+                    edge_sets.append({{"radius": r, "edges": edge_descs}})
+                step["edge_sets"] = edge_sets
+
+            elif isinstance(entity, adsk.fusion.ChamferFeature):
+                ch = entity
+                edge_sets = []
+                for esi in range(ch.edgeSets.count):
+                    es = ch.edgeSets.item(esi)
+                    edge_descs = []
+                    for ei in range(es.edges.count):
+                        e = es.edges.item(ei)
+                        try:
+                            sp = e.startVertex.geometry
+                            ep = e.endVertex.geometry
+                            edge_descs.append({{
+                                "start": [round(sp.x,2), round(sp.y,2), round(sp.z,2)],
+                                "end": [round(ep.x,2), round(ep.y,2), round(ep.z,2)],
+                            }})
+                        except:
+                            pass
+                    edge_sets.append({{"distance": round(es.distance.value, 4), "edges": edge_descs}})
+                step["edge_sets"] = edge_sets
+
+            elif isinstance(entity, adsk.fusion.RevolveFeature):
+                rev = entity
+                step["operation"] = int(rev.operation)
+                try:
+                    step["angle"] = round(math.degrees(rev.angle.value), 1)
+                except:
+                    step["angle"] = 360.0
+                # Profile info
+                try:
+                    p = rev.profile
+                    if hasattr(p, 'areaProperties'):
+                        ap = p.areaProperties()
+                        step["profile"] = {{
+                            "area": round(abs(ap.area), 4),
+                            "centroid": [round(ap.centroid.x, 3), round(ap.centroid.y, 3)],
+                        }}
+                except:
+                    pass
+                # Axis description
+                try:
+                    ax = rev.axis
+                    if hasattr(ax, 'startVertex'):
+                        step["axis_start"] = [round(ax.startVertex.geometry.x,2),
+                                              round(ax.startVertex.geometry.y,2),
+                                              round(ax.startVertex.geometry.z,2)]
+                        step["axis_end"] = [round(ax.endVertex.geometry.x,2),
+                                            round(ax.endVertex.geometry.y,2),
+                                            round(ax.endVertex.geometry.z,2)]
+                    elif hasattr(ax, 'geometry'):
+                        g = ax.geometry
+                        if hasattr(g, 'origin'):
+                            step["axis_origin"] = [round(g.origin.x,2), round(g.origin.y,2), round(g.origin.z,2)]
+                            step["axis_direction"] = [round(g.direction.x,3), round(g.direction.y,3), round(g.direction.z,3)]
+                except:
+                    pass
+
+            elif isinstance(entity, adsk.fusion.CircularPatternFeature):
+                cp = entity
+                step["quantity"] = int(cp.quantity.value) if hasattr(cp.quantity, 'value') else int(cp.quantity)
+                try:
+                    step["total_angle"] = round(math.degrees(cp.totalAngle.value), 1)
+                except:
+                    step["total_angle"] = 360.0
+                # What's being patterned
+                input_names = []
+                for ii in range(cp.inputEntities.count):
+                    ie = cp.inputEntities.item(ii)
+                    input_names.append(ie.objectType.split("::")[-1])
+                step["input_types"] = input_names
+                # Axis
+                try:
+                    ax = cp.axis
+                    step["axis_type"] = ax.objectType.split("::")[-1]
+                    if hasattr(ax, 'geometry'):
+                        g = ax.geometry
+                        if hasattr(g, 'direction'):
+                            step["axis_direction"] = [round(g.direction.x,3), round(g.direction.y,3), round(g.direction.z,3)]
+                except:
+                    pass
+
+            elif isinstance(entity, adsk.fusion.ConstructionPlane):
+                cp = entity
+                defn = cp.definition
+                step["defn_type"] = defn.objectType.split("::")[-1] if defn else "unknown"
+                if hasattr(defn, 'offset'):
+                    step["offset"] = round(defn.offset.value, 4)
+                # What it's offset from
+                try:
+                    parent = defn.planarEntity
+                    if hasattr(parent, 'name'):
+                        step["parent"] = parent.name
+                    elif hasattr(parent, 'objectType'):
+                        pt = parent.objectType.split("::")[-1]
+                        if pt == "BRepFace":
+                            n = parent.geometry.normal
+                            step["parent"] = "face"
+                            step["parent_normal"] = [round(n.x,3), round(n.y,3), round(n.z,3)]
+                            step["parent_z"] = round((parent.boundingBox.minPoint.z + parent.boundingBox.maxPoint.z)/2, 3)
+                        elif pt == "ConstructionPlane":
+                            step["parent"] = parent.name
+                        else:
+                            step["parent"] = pt
+                except:
+                    pass
+
+            elif isinstance(entity, adsk.fusion.Occurrence):
+                step["component_name"] = entity.component.name
+
+        except Exception as ex:
+            step["error"] = str(ex)
+
+        steps.append(step)
+
+    # Build output
+    export = {{"parameters": params, "timeline": steps, "timeline_count": tl_count}}
+
+    # Write to file
+    with open(output_path, "w") as f:
+        f.write("# Fusion 360 Design Export (design_to_python)\\n")
+        f.write("# Generated timeline data with geometric profile/edge descriptions\\n")
+        f.write("# Use this data to generate a reconstruction script\\n\\n")
+        f.write("DESIGN_DATA = ")
+        f.write(json.dumps(export, indent=2, ensure_ascii=False))
+        f.write("\\n")
+
+    print(f"Exported {{tl_count}} timeline steps to {{output_path}}")
+    print(f"Parameters: {{len(params)}}")
+    print(f"Steps with profiles: {{sum(1 for s in steps if 'profiles' in s)}}")
+    print(f"Steps with edge_sets: {{sum(1 for s in steps if 'edge_sets' in s)}}")
+'''
+        result = await _send_to_fusion(export_code, render=False, timeout=120)
         return _build_response(result)
 
     else:
