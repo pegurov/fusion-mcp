@@ -1618,24 +1618,25 @@ def _mesh_analyze_stl(
 
             # --- Curvature-based cylinder detection for watertight meshes ---
             # For each major axis, find triangles with normals perpendicular to it
-            # (cylindrical surfaces). Cluster by estimated center → fit circles.
+            # (cylindrical surfaces). Use intersection-based center finding for accuracy.
             axis_labels = [("Z", 0, 1, 2), ("X", 1, 2, 0), ("Y", 0, 2, 1)]
-            perp_thresh = 0.2  # |n_axis| < this → normal is perpendicular to axis
+            perp_thresh = 0.15  # |n_axis| < this → normal is perpendicular to axis
             all_cylinders: list[dict] = []
+            # Max reasonable radius: half the smallest bounding box dimension
+            max_radius = min(bb_size) / 2.0
 
             for axis_name, u_idx, v_idx, ax_idx in axis_labels:
+                ax_extent = bb_size[ax_idx]
                 # Collect triangles with normals perpendicular to this axis
                 cyl_tris = []
                 for si in range(0, tri_count, max(1, tri_count // min(tri_count, sample_size * 2))):
                     n = tri_normals[si]
                     if abs(n[ax_idx]) > perp_thresh:
                         continue
-                    # Normal is roughly perpendicular to this axis
                     v0, v1, v2 = tri_verts[si]
-                    cx = (v0[u_idx] + v1[u_idx] + v2[u_idx]) / 3
-                    cy = (v0[v_idx] + v1[v_idx] + v2[v_idx]) / 3
-                    cz = (v0[ax_idx] + v1[ax_idx] + v2[ax_idx]) / 3
-                    # Normal in the perpendicular plane
+                    cu = (v0[u_idx] + v1[u_idx] + v2[u_idx]) / 3
+                    cv = (v0[v_idx] + v1[v_idx] + v2[v_idx]) / 3
+                    cax = (v0[ax_idx] + v1[ax_idx] + v2[ax_idx]) / 3
                     nu = n[u_idx]
                     nv = n[v_idx]
                     nlen = math.sqrt(nu**2 + nv**2)
@@ -1643,102 +1644,105 @@ def _mesh_analyze_stl(
                         continue
                     nu /= nlen
                     nv /= nlen
-                    cyl_tris.append((cx, cy, cz, nu, nv))
+                    cyl_tris.append((cu, cv, cax, nu, nv))
 
                 if len(cyl_tris) < 10:
                     continue
 
-                # Estimate cylinder centers: for a cylinder surface, the center is at
-                # centroid - normal * radius. Since we don't know radius, we use the fact
-                # that all normals from the same cylinder point away from the same center.
-                # Strategy: vote for centers using pairs of nearby triangles.
-                # Simpler: bin centroids by (u, v) position and find clusters with
-                # consistent radial normals.
-
-                # Grid-based clustering of centroids
-                grid_size = max(bb_size) / 40  # adaptive grid
-                if grid_size < 0.5:
-                    grid_size = 0.5
-                cell_data: dict[tuple, list] = {}
-                for cx, cy, cz, nu, nv in cyl_tris:
-                    key = (round(cx / grid_size), round(cy / grid_size))
-                    cell_data.setdefault(key, []).append((cx, cy, cz, nu, nv))
-
-                # Find cells that form circular patterns: for each group of cells,
-                # compute the center they point toward
-                # Use RANSAC-like approach: sample pairs, compute center, count inliers
+                # Find cylinder centers by intersecting normal rays from pairs of triangles.
+                # Two points on a cylinder surface with their inward normals: the normals
+                # intersect at the cylinder center.
                 import random
                 random.seed(42)
-                best_centers: list[tuple] = []  # (center_u, center_v, radius, inlier_count, z_min, z_max)
+                best_centers: list[tuple] = []
 
-                flat_pts = cyl_tris
-                n_samples = min(len(flat_pts), 500)
+                n_samples = min(len(cyl_tris), 800)
                 tried_centers: set[tuple] = set()
 
                 for _ in range(n_samples):
-                    # Pick a random triangle
-                    p = flat_pts[random.randint(0, len(flat_pts) - 1)]
-                    cx, cy, cz, nu, nv = p
+                    # Pick two random triangles
+                    i1 = random.randint(0, len(cyl_tris) - 1)
+                    i2 = random.randint(0, len(cyl_tris) - 1)
+                    if i1 == i2:
+                        continue
+                    p1 = cyl_tris[i1]
+                    p2 = cyl_tris[i2]
+                    u1, v1a, z1, nu1, nv1 = p1
+                    u2, v2a, z2, nu2, nv2 = p2
 
-                    # Try different radii
-                    for r_try in [r / 10.0 for r in range(
-                        max(1, int(min_radius * 10)),
-                        min(int(max(bb_size) * 5), 200),
-                        max(1, int(min_radius * 5))
-                    )]:
-                        # Estimated center (normal points outward from center)
-                        est_cu = cx - nu * r_try
-                        est_cv = cy - nv * r_try
-                        # Quantize to avoid duplicates
-                        qkey = (round(est_cu, 1), round(est_cv, 1), round(r_try, 1))
-                        if qkey in tried_centers:
+                    # Check normals aren't parallel
+                    cross = nu1 * nv2 - nv1 * nu2
+                    if abs(cross) < 0.3:
+                        continue
+
+                    # Find intersection of two normal rays:
+                    # P1 + t1 * N1 = P2 + t2 * N2
+                    # Solve for t1: t1 = ((u2-u1)*nv2 - (v2a-v1a)*nu2) / cross
+                    t1 = ((u2 - u1) * nv2 - (v2a - v1a) * nu2) / cross
+                    est_cu = u1 + t1 * nu1
+                    est_cv = v1a + t1 * nv1
+                    r_est = abs(t1)
+
+                    # Sanity checks
+                    if r_est < min_radius or r_est > max_radius:
+                        continue
+
+                    # Verify with second point
+                    r2_check = math.sqrt((u2 - est_cu)**2 + (v2a - est_cv)**2)
+                    if abs(r2_check - r_est) > r_est * 0.15:
+                        continue
+
+                    # Quantize
+                    qkey = (round(est_cu, 0), round(est_cv, 0), round(r_est, 0))
+                    if qkey in tried_centers:
+                        continue
+                    tried_centers.add(qkey)
+
+                    # Count inliers
+                    tol = max(r_est * 0.08, 0.1)
+                    inliers = 0
+                    z_vals = []
+                    for px, py, pz, pnu, pnv in cyl_tris:
+                        dist = math.sqrt((px - est_cu)**2 + (py - est_cv)**2)
+                        if abs(dist - r_est) > tol:
                             continue
-                        tried_centers.add(qkey)
+                        # Normal consistency check
+                        dx = px - est_cu
+                        dy = py - est_cv
+                        dlen = math.sqrt(dx**2 + dy**2)
+                        if dlen < 0.01:
+                            continue
+                        dot = abs((dx / dlen) * pnu + (dy / dlen) * pnv)
+                        if dot > 0.6:
+                            inliers += 1
+                            z_vals.append(pz)
 
-                        # Count inliers: points at distance r_try ± tolerance from this center
-                        # whose normal points away from center
-                        tol = max(r_try * 0.1, 0.15)
-                        inliers = 0
-                        z_vals = []
-                        for px, py, pz, pnu, pnv in flat_pts:
-                            dist = math.sqrt((px - est_cu)**2 + (py - est_cv)**2)
-                            if abs(dist - r_try) > tol:
-                                continue
-                            # Check normal consistency: should point away from center
-                            dx = px - est_cu
-                            dy = py - est_cv
-                            dlen = math.sqrt(dx**2 + dy**2)
-                            if dlen < 0.01:
-                                continue
-                            dot = (dx / dlen) * pnu + (dy / dlen) * pnv
-                            if dot > 0.5:  # normal points outward (hole inner surface points inward: dot < -0.5)
-                                inliers += 1
-                                z_vals.append(pz)
-                            elif dot < -0.5:  # inward normal (inner surface of hole)
-                                inliers += 1
-                                z_vals.append(pz)
-
-                        if inliers >= 12:
-                            z_vals.sort()
-                            best_centers.append((est_cu, est_cv, r_try, inliers,
+                    # Require meaningful inlier count and reasonable height
+                    if inliers >= 20 and z_vals:
+                        z_vals.sort()
+                        height = z_vals[-1] - z_vals[0]
+                        if height <= ax_extent * 1.1 and height >= r_est * 0.3:
+                            # Score: prefer more inliers and tighter radius fit
+                            best_centers.append((est_cu, est_cv, r_est, inliers,
                                                  z_vals[0], z_vals[-1]))
 
-                # Deduplicate and rank centers
+                # Deduplicate: merge nearby centers, keep best
                 best_centers.sort(key=lambda c: -c[3])
                 deduped_cyls = []
                 for cu, cv, r, count, zmin, zmax in best_centers:
                     too_close = False
-                    for dcu, dcv, dr, _, _, _ in deduped_cyls:
-                        if math.sqrt((cu - dcu)**2 + (cv - dcv)**2) < max(r, dr) * 0.5:
+                    for di, (dcu, dcv, dr, dc, _, _) in enumerate(deduped_cyls):
+                        dist = math.sqrt((cu - dcu)**2 + (cv - dcv)**2)
+                        if dist < max(r, dr) * 0.7 and abs(r - dr) < max(r, dr) * 0.3:
                             too_close = True
                             break
-                    if not too_close and count >= 12:
+                    if not too_close:
                         deduped_cyls.append((cu, cv, r, count, zmin, zmax))
 
                 for cu, cv, r, count, zmin, zmax in deduped_cyls[:10]:
                     if r < min_radius:
                         continue
-                    # Build center_3d based on axis
+                    height = zmax - zmin
                     if axis_name == "Z":
                         center_3d = [round(cu, 2), round(cv, 2), round((zmin + zmax) / 2, 2)]
                     elif axis_name == "X":
@@ -1751,14 +1755,14 @@ def _mesh_analyze_stl(
                         "center_mm": center_3d,
                         "radius_mm": round(r, 2),
                         "diameter_mm": round(r * 2, 2),
-                        "height_mm": round(zmax - zmin, 1),
+                        "height_mm": round(height, 1),
                         "inliers": count,
                         "z_range": [round(zmin, 1), round(zmax, 1)],
                     })
 
             if all_cylinders:
-                all_cylinders.sort(key=lambda c: (-c["inliers"], -c["radius_mm"]))
-                # Filter by min_radius and take top results
+                # Sort by inlier density (inliers per unit height) to prefer compact features
+                all_cylinders.sort(key=lambda c: -(c["inliers"] / max(c["height_mm"], 0.1)))
                 all_cylinders = [c for c in all_cylinders if c["radius_mm"] >= min_radius][:15]
 
                 lines.append(f"\n  Detected {len(all_cylinders)} cylindrical features (curvature-based):\n")
@@ -1971,16 +1975,39 @@ def _mesh_analyze_stl(
                         })
 
             if channels_found:
-                lines.append(f"  {axis_name}-axis slices:")
-                for ch in channels_found:
-                    center_str = ", ".join(f"{k}={v}" for k, v in ch["center"].items())
-                    lines.append(
-                        f"    Slice {axis_name}={ch['slice_pos']:.1f} ({ch['slice_frac']:.0%}): "
-                        f"channel at {center_str}, width~{ch['width_mm']:.1f}mm, "
-                        f"extent~{ch['extent_mm']:.1f}mm ({ch['gap_count']} rows)"
-                    )
-                for ch in channels_found:
-                    features_json.append({"type": "channel", "axis": axis_name, **ch})
+                # Keep only significant channels: width > 1mm, extent > 0.5mm, and limit per slice
+                sig_channels = [ch for ch in channels_found
+                                if ch["width_mm"] >= 1.5 and ch["gap_count"] >= 2]
+                # Deduplicate similar channels across slices
+                deduped_channels = []
+                for ch in sig_channels:
+                    merged = False
+                    for dch in deduped_channels:
+                        cv1 = list(ch["center"].values())
+                        cv2 = list(dch["center"].values())
+                        if (abs(cv1[0] - cv2[0]) < 3 and abs(cv1[1] - cv2[1]) < 3
+                                and abs(ch["width_mm"] - dch["width_mm"]) < ch["width_mm"] * 0.5):
+                            if ch["gap_count"] > dch["gap_count"]:
+                                dch.update(ch)
+                            merged = True
+                            break
+                    if not merged:
+                        deduped_channels.append(ch)
+
+                deduped_channels.sort(key=lambda c: -c["width_mm"])
+                deduped_channels = deduped_channels[:10]  # top 10 per axis
+
+                if deduped_channels:
+                    lines.append(f"  {axis_name}-axis slices:")
+                    for ch in deduped_channels:
+                        center_str = ", ".join(f"{k}={v}" for k, v in ch["center"].items())
+                        lines.append(
+                            f"    Slice {axis_name}={ch['slice_pos']:.1f} ({ch['slice_frac']:.0%}): "
+                            f"channel at {center_str}, width~{ch['width_mm']:.1f}mm, "
+                            f"extent~{ch['extent_mm']:.1f}mm ({ch['gap_count']} rows)"
+                        )
+                    for ch in deduped_channels:
+                        features_json.append({"type": "channel", "axis": axis_name, **ch})
 
     # --- Feature relationships ---
     if detect_features and len(features_json) >= 2:
