@@ -184,6 +184,76 @@ def auto_combine(comp, target_z_min=None, target_z_max=None):
         except:
             pass
 
+def _face_matches_desc(face, desc, tol=0.15):
+    """Check if a BRep face matches a geometric descriptor by type+properties.
+    Returns True/False for geometry match (bb_center used separately for scoring)."""
+    g = face.geometry
+    gt = g.objectType.split("::")[-1] if g else ""
+    dt = desc.get("type", "")
+    if gt != dt:
+        return False
+    try:
+        if "normal" in desc and hasattr(g, 'normal'):
+            dn = desc["normal"]
+            if not (abs(g.normal.x - dn[0]) < tol and
+                    abs(g.normal.y - dn[1]) < tol and
+                    abs(g.normal.z - dn[2]) < tol):
+                return False
+        elif "radius" in desc and hasattr(g, 'radius'):
+            if abs(g.radius - desc["radius"]) > tol:
+                return False
+        return True
+    except:
+        pass
+    return gt == dt
+
+def _face_position_score(face, desc):
+    """Score how close a face's BB center is to the descriptor's bb_center. Lower=better."""
+    if "bb_center" not in desc:
+        return 0
+    try:
+        bb = face.boundingBox
+        fc = [(bb.minPoint.x+bb.maxPoint.x)/2, (bb.minPoint.y+bb.maxPoint.y)/2, (bb.minPoint.z+bb.maxPoint.z)/2]
+        dc = desc["bb_center"]
+        return math.sqrt((fc[0]-dc[0])**2 + (fc[1]-dc[1])**2 + (fc[2]-dc[2])**2)
+    except:
+        return 0
+
+def find_edges_by_descriptors(comp, descriptors):
+    """Find edges by matching adjacent face geometric descriptors.
+    Each descriptor has center (approximate), face_a, face_b.
+    Primary matching is by face types; center is used as tiebreaker."""
+    coll = adsk.core.ObjectCollection.create()
+    for desc in descriptors:
+        center = desc["center"]
+        fa_desc = desc["face_a"]
+        fb_desc = desc["face_b"]
+        best_edge, best_score = None, 1e9
+        for bi in range(comp.bRepBodies.count):
+            body = comp.bRepBodies.item(bi)
+            for ei in range(body.edges.count):
+                edge = body.edges.item(ei)
+                try:
+                    if edge.faces.count < 2:
+                        continue
+                    f0 = edge.faces.item(0)
+                    f1 = edge.faces.item(1)
+                    match = ((_face_matches_desc(f0, fa_desc) and _face_matches_desc(f1, fb_desc)) or
+                             (_face_matches_desc(f0, fb_desc) and _face_matches_desc(f1, fa_desc)))
+                    if match:
+                        # Score by face position similarity (lower=better)
+                        score = _face_position_score(f0, fa_desc) + _face_position_score(f1, fb_desc)
+                        alt_score = _face_position_score(f0, fb_desc) + _face_position_score(f1, fa_desc)
+                        score = min(score, alt_score)
+                        if score < best_score:
+                            best_edge = edge
+                            best_score = dist
+                except:
+                    pass
+        if best_edge:
+            coll.add(best_edge)
+    return coll
+
 '''
 
     lines = [HELPERS.strip(), "", "results = []", "try:"]
@@ -367,45 +437,26 @@ def auto_combine(comp, target_z_min=None, target_z_max=None):
 
         elif stype == 'FilletFeature':
             edges_data = step.get('edge_sets', [])
+            edge_descs = step.get('edge_descriptors', [])
             faces = step.get('faces', [])
-            edge_midpoints = step.get('edge_midpoints', [])
-            if edges_data and (faces or edge_midpoints):
+            if edges_data and (edge_descs or faces):
                 r = edges_data[0].get('radius', 0.1)
                 bboxes = [(f['bb_min'], f['bb_max']) for f in faces if 'bb_min' in f]
-                n_faces = len(bboxes)
-                # Note: auto_combine disabled - causes handle fillet regression
-                lines.append(f"{I2}_body = get_body({comp_var}, '{body_name}') or find_body_for_edges({comp_var}, {bboxes}) or {comp_var}.bRepBodies.item(0)")
-                lines.append(f"{I2}_edges = adsk.core.ObjectCollection.create()")
-                if bboxes:
-                    lines.append(f"{I2}for _bbmin, _bbmax in {bboxes}:")
-                    lines.append(f"{I2}    _t=0.12")
-                    lines.append(f"{I2}    for _bi in range({comp_var}.bRepBodies.count):")
-                    lines.append(f"{I2}        _bb = {comp_var}.bRepBodies.item(_bi)")
-                    lines.append(f"{I2}        for _ei in range(_bb.edges.count):")
-                    lines.append(f"{I2}            try:")
-                    lines.append(f"{I2}                _ok,_pt = _bb.edges.item(_ei).evaluator.getPointAtParameter(0.5)")
-                    lines.append(f"{I2}                if _ok and _bbmin[0]-_t<=_pt.x<=_bbmax[0]+_t and _bbmin[1]-_t<=_pt.y<=_bbmax[1]+_t and _bbmin[2]-_t<=_pt.z<=_bbmax[2]+_t:")
-                    lines.append(f"{I2}                    _edges.add(_bb.edges.item(_ei)); break")
-                    lines.append(f"{I2}            except: pass")
-                    lines.append(f"{I2}        if _edges.count >= len({bboxes}): break")
-                    # Fallback: zone-based matching if BB matching found nothing
-                    lines.append(f"{I2}if _edges.count == 0:")
-                    lines.append(f"{I2}    _edges = find_edges_by_zone(_body, {bboxes}, {n_faces})")
-                elif edge_midpoints:
-                    # Match edges by midpoint proximity (fallback when faces are unavailable)
-                    mp_list = edge_midpoints
-                    lines.append(f"{I2}_mps = {mp_list}")
-                    lines.append(f"{I2}for _mp in _mps:")
-                    lines.append(f"{I2}    _best_d, _best_ei = 1e9, -1")
-                    lines.append(f"{I2}    for _ei in range(_body.edges.count):")
-                    lines.append(f"{I2}        try:")
-                    lines.append(f"{I2}            _ok,_pt = _body.edges.item(_ei).evaluator.getPointAtParameter(0.5)")
-                    lines.append(f"{I2}            if _ok:")
-                    lines.append(f"{I2}                _d = math.sqrt((_pt.x-_mp[0])**2+(_pt.y-_mp[1])**2+(_pt.z-_mp[2])**2)")
-                    lines.append(f"{I2}                if _d < _best_d: _best_d, _best_ei = _d, _ei")
-                    lines.append(f"{I2}        except: pass")
-                    lines.append(f"{I2}    if _best_ei >= 0 and _best_d < 0.3:")
-                    lines.append(f"{I2}        _edges.add(_body.edges.item(_best_ei))")
+                if edge_descs:
+                    # PRIMARY: find edges by geometric descriptors
+                    lines.append(f"{I2}_edges = find_edges_by_descriptors({comp_var}, {edge_descs})")
+                    # FALLBACK: if descriptors found nothing, use face BB matching
+                    if bboxes:
+                        n_faces = len(bboxes)
+                        lines.append(f"{I2}if _edges.count == 0:")
+                        lines.append(f"{I2}    _body = get_body({comp_var}, '{body_name}') or find_body_for_edges({comp_var}, {bboxes}) or {comp_var}.bRepBodies.item(0)")
+                        lines.append(f"{I2}    _edges = find_edges_by_zone(_body, {bboxes}, {n_faces})")
+                elif bboxes:
+                    n_faces = len(bboxes)
+                    lines.append(f"{I2}_body = get_body({comp_var}, '{body_name}') or find_body_for_edges({comp_var}, {bboxes}) or {comp_var}.bRepBodies.item(0)")
+                    lines.append(f"{I2}_edges = find_edges_by_zone(_body, {bboxes}, {n_faces})")
+                else:
+                    lines.append(f"{I2}_edges = adsk.core.ObjectCollection.create()")
                 lines.append(f"{I2}if _edges.count > 0:")
                 lines.append(f"{I2}    _fi={comp_var}.features.filletFeatures.createInput()")
                 lines.append(f"{I2}    _fi.addConstantRadiusEdgeSet(_edges, VI({r}), True)")
@@ -424,26 +475,24 @@ def auto_combine(comp, target_z_min=None, target_z_max=None):
 
         elif stype == 'ChamferFeature':
             edges_data = step.get('edge_sets', [])
+            edge_descs = step.get('edge_descriptors', [])
             faces = step.get('faces', [])
-            if edges_data and faces:
+            if edges_data and (edge_descs or faces):
                 d = edges_data[0].get('distance', 0.1)
                 bboxes = [(f['bb_min'], f['bb_max']) for f in faces if 'bb_min' in f]
-                n_faces = len(bboxes)
-                lines.append(f"{I2}_body = get_body({comp_var}, '{body_name}') or find_body_for_edges({comp_var}, {bboxes}) or {comp_var}.bRepBodies.item(0)")
-                lines.append(f"{I2}_edges = adsk.core.ObjectCollection.create()")
-                lines.append(f"{I2}for _bbmin, _bbmax in {bboxes}:")
-                lines.append(f"{I2}    _t=0.12")
-                lines.append(f"{I2}    for _bi in range({comp_var}.bRepBodies.count):")
-                lines.append(f"{I2}        _bb = {comp_var}.bRepBodies.item(_bi)")
-                lines.append(f"{I2}        for _ei in range(_bb.edges.count):")
-                lines.append(f"{I2}            try:")
-                lines.append(f"{I2}                _ok,_pt = _bb.edges.item(_ei).evaluator.getPointAtParameter(0.5)")
-                lines.append(f"{I2}                if _ok and _bbmin[0]-_t<=_pt.x<=_bbmax[0]+_t and _bbmin[1]-_t<=_pt.y<=_bbmax[1]+_t and _bbmin[2]-_t<=_pt.z<=_bbmax[2]+_t:")
-                lines.append(f"{I2}                    _edges.add(_bb.edges.item(_ei)); break")
-                lines.append(f"{I2}            except: pass")
-                lines.append(f"{I2}        if _edges.count >= len({bboxes}): break")
-                lines.append(f"{I2}if _edges.count == 0:")
-                lines.append(f"{I2}    _edges = find_edges_by_zone(_body, {bboxes}, {n_faces})")
+                if edge_descs:
+                    lines.append(f"{I2}_edges = find_edges_by_descriptors({comp_var}, {edge_descs})")
+                    if bboxes:
+                        n_faces = len(bboxes)
+                        lines.append(f"{I2}if _edges.count == 0:")
+                        lines.append(f"{I2}    _body = get_body({comp_var}, '{body_name}') or find_body_for_edges({comp_var}, {bboxes}) or {comp_var}.bRepBodies.item(0)")
+                        lines.append(f"{I2}    _edges = find_edges_by_zone(_body, {bboxes}, {n_faces})")
+                elif bboxes:
+                    n_faces = len(bboxes)
+                    lines.append(f"{I2}_body = get_body({comp_var}, '{body_name}') or find_body_for_edges({comp_var}, {bboxes}) or {comp_var}.bRepBodies.item(0)")
+                    lines.append(f"{I2}_edges = find_edges_by_zone(_body, {bboxes}, {n_faces})")
+                else:
+                    lines.append(f"{I2}_edges = adsk.core.ObjectCollection.create()")
                 lines.append(f"{I2}if _edges.count > 0:")
                 lines.append(f"{I2}    _chi={comp_var}.features.chamferFeatures.createInput2()")
                 lines.append(f"{I2}    _chi.chamferEdgeSets.addEqualDistanceChamferEdgeSet(_edges, VI({d}), True)")

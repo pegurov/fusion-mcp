@@ -1778,6 +1778,26 @@ else:
         params.append({{"name": p.name, "expression": p.expression, "unit": p.unit,
                         "value": round(p.value, 6)}})
 
+    # Helper: describe face geometry for edge matching
+    def _describe_face(f):
+        g = f.geometry
+        gt = g.objectType.split("::")[-1] if g else "unknown"
+        d = {{"type": gt}}
+        try:
+            # Face BB center for position disambiguation
+            _fbb = f.boundingBox
+            d["bb_center"] = [round((_fbb.minPoint.x+_fbb.maxPoint.x)/2, 3),
+                              round((_fbb.minPoint.y+_fbb.maxPoint.y)/2, 3),
+                              round((_fbb.minPoint.z+_fbb.maxPoint.z)/2, 3)]
+            if hasattr(g, 'normal'):  # Plane
+                d["normal"] = [round(g.normal.x,4), round(g.normal.y,4), round(g.normal.z,4)]
+            elif hasattr(g, 'axis') and hasattr(g, 'radius'):  # Cylinder/Cone
+                d["axis"] = [round(g.axis.x,4), round(g.axis.y,4), round(g.axis.z,4)]
+                d["radius"] = round(g.radius, 4)
+        except:
+            pass
+        return d
+
     # Roll through timeline step by step
     # IMPORTANT: roll timeline to each step to get correct profile/edge data
     for ti in range(tl_count):
@@ -1970,21 +1990,44 @@ else:
                     edge_sets.append({{"radius": r}})
                 step["edge_sets"] = edge_sets
 
-                # PRIMARY: Get edge midpoints from edgeSets (exact edge references)
-                edge_midpoints = []
+                # Edge descriptors via fillet face → adjacent non-fillet face analysis
+                # Each fillet face replaces an original edge; its neighbors are the original faces
+                edge_descriptors = []
                 try:
-                    for esi in range(fil.edgeSets.count):
-                        es = fil.edgeSets.item(esi)
-                        for ei in range(es.edges.count):
-                            edge = es.edges.item(ei)
-                            ok, pt = edge.evaluator.getPointAtParameter(0.5)
-                            if ok:
-                                edge_midpoints.append([round(pt.x,4), round(pt.y,4), round(pt.z,4)])
+                    # Build set of fillet face tempIds
+                    _fillet_tids = set()
+                    for _fi in range(fil.faces.count):
+                        _fillet_tids.add(fil.faces.item(_fi).tempId)
+
+                    for _fi in range(fil.faces.count):
+                        _ff = fil.faces.item(_fi)
+                        # Find adjacent non-fillet faces
+                        _adj = []
+                        _seen = set()
+                        for _ei in range(_ff.edges.count):
+                            _edge = _ff.edges.item(_ei)
+                            for _afi in range(_edge.faces.count):
+                                _af = _edge.faces.item(_afi)
+                                _tid = _af.tempId
+                                if _tid not in _fillet_tids and _tid not in _seen:
+                                    _seen.add(_tid)
+                                    _adj.append(_describe_face(_af))
+                        if len(_adj) >= 2:
+                            # Fillet face center as approximate edge location
+                            _bb = _ff.boundingBox
+                            _cx = round((_bb.minPoint.x + _bb.maxPoint.x)/2, 4)
+                            _cy = round((_bb.minPoint.y + _bb.maxPoint.y)/2, 4)
+                            _cz = round((_bb.minPoint.z + _bb.maxPoint.z)/2, 4)
+                            edge_descriptors.append({{
+                                "center": [_cx, _cy, _cz],
+                                "face_a": _adj[0],
+                                "face_b": _adj[1],
+                            }})
                 except:
                     pass
-                step["edge_midpoints"] = edge_midpoints
+                step["edge_descriptors"] = edge_descriptors
 
-                # SECONDARY: Face geometry (fallback if edges unavailable)
+                # FALLBACK: Face bounding boxes (for backward compat)
                 fillet_faces = []
                 for fi in range(fil.faces.count):
                     f = fil.faces.item(fi)
@@ -2012,21 +2055,40 @@ else:
                     edge_sets.append({{"distance": round(es.distance.value, 4)}})
                 step["edge_sets"] = edge_sets
 
-                # PRIMARY: Get edge midpoints from edgeSets
-                edge_midpoints = []
+                # Edge descriptors via chamfer face → adjacent face analysis
+                edge_descriptors = []
                 try:
-                    for esi in range(ch.edgeSets.count):
-                        es = ch.edgeSets.item(esi)
-                        for ei in range(es.edges.count):
-                            edge = es.edges.item(ei)
-                            ok, pt = edge.evaluator.getPointAtParameter(0.5)
-                            if ok:
-                                edge_midpoints.append([round(pt.x,4), round(pt.y,4), round(pt.z,4)])
+                    _cham_tids = set()
+                    for _fi in range(ch.faces.count):
+                        _cham_tids.add(ch.faces.item(_fi).tempId)
+
+                    for _fi in range(ch.faces.count):
+                        _cf = ch.faces.item(_fi)
+                        _adj = []
+                        _seen = set()
+                        for _ei in range(_cf.edges.count):
+                            _edge = _cf.edges.item(_ei)
+                            for _afi in range(_edge.faces.count):
+                                _af = _edge.faces.item(_afi)
+                                _tid = _af.tempId
+                                if _tid not in _cham_tids and _tid not in _seen:
+                                    _seen.add(_tid)
+                                    _adj.append(_describe_face(_af))
+                        if len(_adj) >= 2:
+                            _bb = _cf.boundingBox
+                            _cx = round((_bb.minPoint.x + _bb.maxPoint.x)/2, 4)
+                            _cy = round((_bb.minPoint.y + _bb.maxPoint.y)/2, 4)
+                            _cz = round((_bb.minPoint.z + _bb.maxPoint.z)/2, 4)
+                            edge_descriptors.append({{
+                                "center": [_cx, _cy, _cz],
+                                "face_a": _adj[0],
+                                "face_b": _adj[1],
+                            }})
                 except:
                     pass
-                step["edge_midpoints"] = edge_midpoints
+                step["edge_descriptors"] = edge_descriptors
 
-                # SECONDARY: Face geometry (fallback)
+                # FALLBACK: Face bounding boxes
                 chamfer_faces = []
                 for fi in range(ch.faces.count):
                     f = ch.faces.item(fi)
