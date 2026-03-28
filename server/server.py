@@ -482,6 +482,400 @@ async def list_tools() -> list[Tool]:
     ]
 
 
+def _generate_reconstruction_script(data: dict) -> str:
+    """Dynamically load and run the generator from generator.py (hot-reloadable)."""
+    import importlib, sys
+    gen_path = os.path.join(os.path.dirname(__file__), 'generator.py')
+    spec = importlib.util.spec_from_file_location("generator", gen_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod._generate_reconstruction_script(data)
+
+
+def _generate_reconstruction_script_ORIGINAL(data: dict) -> str:
+    """Generate a Fusion 360 Python reconstruction script from exported timeline data."""
+    import math as _math
+
+    HELPERS = '''import adsk.core, adsk.fusion, math, traceback
+
+def P(x, y, z=0):
+    return adsk.core.Point3D.create(x, y, z)
+
+def VI(v):
+    return adsk.core.ValueInput.createByReal(v)
+
+def find_profile(sketch, area, cx, cy, tol_a=0.15, tol_p=0.2):
+    best, best_s = None, 1e9
+    for i in range(sketch.profiles.count):
+        p = sketch.profiles.item(i)
+        try:
+            ap = p.areaProperties()
+            a = abs(ap.area)
+            ad = abs(a - area) / max(area, 1e-6)
+            pd = math.sqrt((ap.centroid.x - cx)**2 + (ap.centroid.y - cy)**2)
+            if ad < tol_a and pd < tol_p:
+                s = ad + pd
+                if s < best_s:
+                    best, best_s = p, s
+        except: pass
+    return best
+
+def find_profiles(sketch, targets):
+    coll = adsk.core.ObjectCollection.create()
+    for a, cx, cy in targets:
+        p = find_profile(sketch, a, cx, cy)
+        if not p:
+            p = find_profile(sketch, a, cx, cy, tol_a=0.3, tol_p=0.5)
+        if p: coll.add(p)
+    return coll
+
+_OP = {0: adsk.fusion.FeatureOperations.JoinFeatureOperation,
+       1: adsk.fusion.FeatureOperations.CutFeatureOperation,
+       2: adsk.fusion.FeatureOperations.IntersectFeatureOperation,
+       3: adsk.fusion.FeatureOperations.NewBodyFeatureOperation}
+
+def do_extrude(comp, profile, distance, operation, symmetric=False):
+    ext_input = comp.features.extrudeFeatures.createInput(profile, _OP[operation])
+    if symmetric:
+        ext_input.setSymmetricExtent(VI(abs(distance)), True)
+    else:
+        ext_input.setDistanceExtent(False, VI(distance))
+    return comp.features.extrudeFeatures.add(ext_input)
+
+def extrude_safe(comp, profile, distance, operation, symmetric=False):
+    try:
+        return do_extrude(comp, profile, distance, operation, symmetric)
+    except Exception as e:
+        if 'No target body' in str(e):
+            return do_extrude(comp, profile, -distance, operation, symmetric)
+        raise
+
+def get_body(comp, name):
+    for i in range(comp.bRepBodies.count):
+        if comp.bRepBodies.item(i).name == name:
+            return comp.bRepBodies.item(i)
+    return None
+'''
+
+    lines = [HELPERS.strip(), "", "results = []", "try:"]
+    I = "    "      # single indent (inside main try)
+    I2 = "        "  # double indent (inside step try)
+
+    sketch_vars = {}   # sketch_name -> var
+    plane_vars = {}    # step_index -> var
+    comp_var = "rootComp"
+    comp_names = {}    # component_name -> var
+    feature_vars = {}  # step_index -> var
+
+    # Pre-scan: find sketches used by revolves and their profile centroids
+    revolve_sketches = set()
+    revolve_profile_centroids = {}  # sketch_name -> [(cx, cy), ...]
+    timeline = data.get('timeline', [])
+    for si, step in enumerate(timeline):
+        if step.get('type') == 'RevolveFeature':
+            prof = step.get('profile', {})
+            for pi in range(si - 1, -1, -1):
+                if timeline[pi].get('type') == 'Sketch':
+                    sk_name = timeline[pi].get('name', '')
+                    revolve_sketches.add(sk_name)
+                    if prof and 'centroid' in prof:
+                        if sk_name not in revolve_profile_centroids:
+                            revolve_profile_centroids[sk_name] = []
+                        revolve_profile_centroids[sk_name].append(prof['centroid'])
+                    break
+
+    for step in timeline:
+        idx = step['index']
+        stype = step.get('type', '')
+        sname = step.get('name', f'step_{idx}')
+
+        lines.append(f"{I}# ── Step {idx}: {sname} ──")
+        lines.append(f"{I}try:")
+
+        # --- Determine active component ---
+        body_name = step.get('body_name', '')
+        if body_name and body_name in comp_names:
+            comp_var = comp_names[body_name]
+        elif body_name and body_name not in comp_names and comp_var != "rootComp":
+            comp_var = "rootComp"
+
+        if stype == 'Sketch':
+            var = f"sk_{idx}"
+            sketch_vars[sname] = var
+            plane_ref = step.get('plane', 'XY')
+
+            if plane_ref == 'XY':
+                lines.append(f"{I2}{var} = {comp_var}.sketches.add({comp_var}.xYConstructionPlane)")
+            elif plane_ref == 'XZ':
+                lines.append(f"{I2}{var} = {comp_var}.sketches.add({comp_var}.xZConstructionPlane)")
+            elif plane_ref == 'YZ':
+                lines.append(f"{I2}{var} = {comp_var}.sketches.add({comp_var}.yZConstructionPlane)")
+            elif plane_ref == 'face':
+                fz = step.get('face_center_z', 0)
+                fnz = step.get('face_normal', [0,0,1])[2]
+                lines.append(f"{I2}_face = None")
+                lines.append(f"{I2}for _bi in range({comp_var}.bRepBodies.count):")
+                lines.append(f"{I2}    _b = {comp_var}.bRepBodies.item(_bi)")
+                lines.append(f"{I2}    for _fi in range(_b.faces.count):")
+                lines.append(f"{I2}        try:")
+                lines.append(f"{I2}            _g = _b.faces.item(_fi).geometry")
+                lines.append(f"{I2}            if hasattr(_g,'normal') and abs(_g.normal.z-({fnz}))<0.15:")
+                lines.append(f"{I2}                _zc=(_b.faces.item(_fi).boundingBox.minPoint.z+_b.faces.item(_fi).boundingBox.maxPoint.z)/2")
+                lines.append(f"{I2}                if abs(_zc-{fz})<0.15: _face=_b.faces.item(_fi); break")
+                lines.append(f"{I2}        except: pass")
+                lines.append(f"{I2}    if _face: break")
+                lines.append(f"{I2}if _face:")
+                lines.append(f"{I2}    {var} = {comp_var}.sketches.add(_face)")
+                lines.append(f"{I2}else:")
+                lines.append(f"{I2}    _pi={comp_var}.constructionPlanes.createInput()")
+                lines.append(f"{I2}    _pi.setByOffset({comp_var}.xYConstructionPlane, VI({fz}))")
+                lines.append(f"{I2}    {var}={comp_var}.sketches.add({comp_var}.constructionPlanes.add(_pi))")
+            else:
+                # Named plane - look up
+                found = None
+                for pidx, pvar in plane_vars.items():
+                    pstep = data['timeline'][pidx] if pidx < len(data['timeline']) else {}
+                    if pstep.get('name', '') == plane_ref:
+                        found = f"plane_{pidx}"
+                        break
+                if found:
+                    lines.append(f"{I2}{var} = {comp_var}.sketches.add({found})")
+                else:
+                    lines.append(f"{I2}# WARNING: plane '{plane_ref}' not resolved")
+                    lines.append(f"{I2}{var} = {comp_var}.sketches.add({comp_var}.xYConstructionPlane)")
+
+            lines.append(f'{I2}{var}.name = "{sname}"')
+
+            curves = step.get('curves', [])
+            if curves:
+                lines.append(f"{I2}{var}.isComputeDeferred = True")
+                for c in curves:
+                    ct = c.get('type', '')
+                    ic = c.get('construction', False)
+                    if ct == 'SketchCircle':
+                        cx, cy = c['center']
+                        lines.append(f"{I2}{var}.sketchCurves.sketchCircles.addByCenterRadius(P({cx},{cy}),{c['radius']})")
+                    elif ct == 'SketchLine':
+                        sx, sy = c['start']; ex, ey = c['end']
+                        # For revolve sketches: only curves near profile centroid stay non-construction
+                        make_construction = False
+                        if sname in revolve_profile_centroids and not ic:
+                            centroids = revolve_profile_centroids[sname]
+                            near_any = False
+                            for pcx, pcy in centroids:
+                                d1 = _math.sqrt((sx-pcx)**2 + (sy-pcy)**2)
+                                d2 = _math.sqrt((ex-pcx)**2 + (ey-pcy)**2)
+                                if d1 < 0.25 and d2 < 0.25:
+                                    near_any = True; break
+                            if not near_any:
+                                make_construction = True
+                        if ic or make_construction:
+                            lines.append(f"{I2}_cl={var}.sketchCurves.sketchLines.addByTwoPoints(P({sx},{sy}),P({ex},{ey})); _cl.isConstruction=True")
+                        else:
+                            lines.append(f"{I2}{var}.sketchCurves.sketchLines.addByTwoPoints(P({sx},{sy}),P({ex},{ey}))")
+                    elif ct == 'SketchArc':
+                        cx, cy = c['center']; r = c['radius']
+                        sx, sy = c['start']; ex, ey = c['end']
+                        sweep = _math.atan2(ey-cy, ex-cx) - _math.atan2(sy-cy, sx-cx)
+                        if sweep > _math.pi: sweep -= 2*_math.pi
+                        elif sweep < -_math.pi: sweep += 2*_math.pi
+                        if ic:
+                            lines.append(f"{I2}_cl={var}.sketchCurves.sketchArcs.addByCenterStartSweep(P({cx},{cy}),P({sx},{sy}),{round(sweep,6)}); _cl.isConstruction=True")
+                        else:
+                            lines.append(f"{I2}{var}.sketchCurves.sketchArcs.addByCenterStartSweep(P({cx},{cy}),P({sx},{sy}),{round(sweep,6)})")
+                lines.append(f"{I2}{var}.isComputeDeferred = False")
+            lines.append(f'{I2}results.append(f"Step {idx}: {sname} - {{{var}.profiles.count}} profiles")')
+
+        elif stype == 'ExtrudeFeature':
+            var = f"ext_{idx}"
+            feature_vars[idx] = var
+            sk_name = step.get('sketch_name', '')
+            sk_var = sketch_vars.get(sk_name, 'sk_0')
+            profiles = step.get('profiles', [])
+            op = step.get('operation', 0)
+            dist = step.get('distance', 0)
+            is_sym = 'Symmetric' in step.get('extent_type', '')
+
+            if len(profiles) == 1:
+                p = profiles[0]
+                lines.append(f"{I2}_p = find_profile({sk_var}, {p['area']}, {p['centroid'][0]}, {p['centroid'][1]})")
+                lines.append(f"{I2}if not _p: _p = find_profile({sk_var}, {p['area']}, {p['centroid'][0]}, {p['centroid'][1]}, tol_a=0.3, tol_p=0.5)")
+                lines.append(f"{I2}if _p:")
+                fn = "do_extrude" if op == 3 else "extrude_safe"
+                sym = ", symmetric=True" if is_sym else ""
+                lines.append(f'{I2}    {var} = {fn}({comp_var}, _p, {dist}, {op}{sym})')
+                lines.append(f'{I2}    results.append("Step {idx}: {sname}")')
+                lines.append(f"{I2}else:")
+                lines.append(f'{I2}    {var} = None')
+                lines.append(f'{I2}    results.append("Step {idx}: {sname} FAILED")')
+            elif len(profiles) > 1:
+                targets = [(p['area'], p['centroid'][0], p['centroid'][1]) for p in profiles]
+                lines.append(f"{I2}_profs = find_profiles({sk_var}, {targets})")
+                lines.append(f"{I2}if _profs.count > 0:")
+                fn = "do_extrude" if op == 3 else "extrude_safe"
+                lines.append(f'{I2}    {var} = {fn}({comp_var}, _profs, {dist}, {op})')
+                lines.append(f'{I2}    results.append(f"Step {idx}: {sname} - {{_profs.count}}/{len(profiles)}")')
+                lines.append(f"{I2}else:")
+                lines.append(f'{I2}    {var} = None')
+                lines.append(f'{I2}    results.append("Step {idx}: {sname} FAILED")')
+            else:
+                lines.append(f'{I2}{var} = None')
+                lines.append(f'{I2}results.append("Step {idx}: {sname} SKIPPED - no profiles")')
+
+        elif stype == 'FilletFeature':
+            edges_data = step.get('edge_sets', [])
+            faces = step.get('faces', [])
+            if edges_data and faces:
+                r = edges_data[0].get('radius', 0.1)
+                bboxes = [(f['bb_min'], f['bb_max']) for f in faces if 'bb_min' in f]
+                lines.append(f"{I2}_body = get_body({comp_var}, '{body_name}') or {comp_var}.bRepBodies.item(0)")
+                lines.append(f"{I2}_edges = adsk.core.ObjectCollection.create()")
+                lines.append(f"{I2}for _bbmin, _bbmax in {bboxes}:")
+                lines.append(f"{I2}    _t=0.12")
+                lines.append(f"{I2}    for _ei in range(_body.edges.count):")
+                lines.append(f"{I2}        try:")
+                lines.append(f"{I2}            _ok,_pt = _body.edges.item(_ei).evaluator.getPointAtParameter(0.5)")
+                lines.append(f"{I2}            if _ok and _bbmin[0]-_t<=_pt.x<=_bbmax[0]+_t and _bbmin[1]-_t<=_pt.y<=_bbmax[1]+_t and _bbmin[2]-_t<=_pt.z<=_bbmax[2]+_t:")
+                lines.append(f"{I2}                _edges.add(_body.edges.item(_ei)); break")
+                lines.append(f"{I2}        except: pass")
+                lines.append(f"{I2}if _edges.count > 0:")
+                lines.append(f"{I2}    _fi={comp_var}.features.filletFeatures.createInput()")
+                lines.append(f"{I2}    _fi.addConstantRadiusEdgeSet(_edges, VI({r}), True)")
+                lines.append(f"{I2}    {comp_var}.features.filletFeatures.add(_fi)")
+                lines.append(f'{I2}    results.append(f"Step {idx}: {sname} r={round(r*10,1)}mm - {{_edges.count}} edges")')
+                lines.append(f"{I2}else:")
+                lines.append(f'{I2}    results.append("Step {idx}: {sname} SKIPPED")')
+            else:
+                lines.append(f'{I2}results.append("Step {idx}: {sname} SKIPPED - no data")')
+
+        elif stype == 'ChamferFeature':
+            edges_data = step.get('edge_sets', [])
+            faces = step.get('faces', [])
+            if edges_data and faces:
+                d = edges_data[0].get('distance', 0.1)
+                bboxes = [(f['bb_min'], f['bb_max']) for f in faces if 'bb_min' in f]
+                lines.append(f"{I2}_body = get_body({comp_var}, '{body_name}') or {comp_var}.bRepBodies.item(0)")
+                lines.append(f"{I2}_edges = adsk.core.ObjectCollection.create()")
+                lines.append(f"{I2}for _bbmin, _bbmax in {bboxes}:")
+                lines.append(f"{I2}    _t=0.12")
+                lines.append(f"{I2}    for _ei in range(_body.edges.count):")
+                lines.append(f"{I2}        try:")
+                lines.append(f"{I2}            _ok,_pt = _body.edges.item(_ei).evaluator.getPointAtParameter(0.5)")
+                lines.append(f"{I2}            if _ok and _bbmin[0]-_t<=_pt.x<=_bbmax[0]+_t and _bbmin[1]-_t<=_pt.y<=_bbmax[1]+_t and _bbmin[2]-_t<=_pt.z<=_bbmax[2]+_t:")
+                lines.append(f"{I2}                _edges.add(_body.edges.item(_ei)); break")
+                lines.append(f"{I2}        except: pass")
+                lines.append(f"{I2}if _edges.count > 0:")
+                lines.append(f"{I2}    _chi={comp_var}.features.chamferFeatures.createInput2()")
+                lines.append(f"{I2}    _chi.chamferEdgeSets.addEqualDistanceChamferEdgeSet(_edges, VI({d}), True)")
+                lines.append(f"{I2}    {comp_var}.features.chamferFeatures.add(_chi)")
+                lines.append(f'{I2}    results.append(f"Step {idx}: {sname} - {{_edges.count}} edges")')
+                lines.append(f"{I2}else:")
+                lines.append(f'{I2}    results.append("Step {idx}: {sname} SKIPPED")')
+            else:
+                lines.append(f'{I2}results.append("Step {idx}: {sname} SKIPPED")')
+
+        elif stype == 'RevolveFeature':
+            var = f"rev_{idx}"
+            feature_vars[idx] = var
+            op = step.get('operation', 1)
+            angle = step.get('angle', 360.0)
+            prof = step.get('profile', {})
+            op_names = {0:'JoinFeatureOperation',1:'CutFeatureOperation',3:'NewBodyFeatureOperation'}
+            op_name = op_names.get(op, 'CutFeatureOperation')
+            prev_sk = None
+            for pi in range(idx-1, -1, -1):
+                ps = data['timeline'][pi]
+                if ps.get('type') == 'Sketch':
+                    prev_sk = sketch_vars.get(ps.get('name'))
+                    break
+            if prof and prev_sk:
+                a = prof.get('area', 0)
+                cx, cy = prof.get('centroid', [0,0])
+                angle_rad = round(_math.radians(angle), 6)
+                # Determine best axis: try Z, Y, X (Z is most common for cylindrical revolves)
+                lines.append(f"{I2}_p = find_profile({prev_sk}, {a}, {cx}, {cy}, tol_a=0.3, tol_p=0.3)")
+                lines.append(f"{I2}{var} = None")
+                lines.append(f"{I2}if _p:")
+                lines.append(f"{I2}    for _ax in [{comp_var}.zConstructionAxis, {comp_var}.yConstructionAxis, {comp_var}.xConstructionAxis]:")
+                lines.append(f"{I2}        try:")
+                lines.append(f"{I2}            _ri = {comp_var}.features.revolveFeatures.createInput(_p, _ax, adsk.fusion.FeatureOperations.{op_name})")
+                lines.append(f"{I2}            _ri.setAngleExtent(False, VI({angle_rad}))")
+                lines.append(f"{I2}            {var} = {comp_var}.features.revolveFeatures.add(_ri)")
+                lines.append(f'{I2}            results.append("Step {idx}: {sname}"); break')
+                lines.append(f"{I2}        except: pass")
+                lines.append(f"{I2}    else:")
+                lines.append(f'{I2}        results.append("Step {idx}: {sname} FAILED - all axes")')
+                lines.append(f"{I2}else:")
+                lines.append(f'{I2}    results.append("Step {idx}: {sname} FAILED - no profile")')
+            else:
+                lines.append(f"{I2}{var} = None")
+                lines.append(f'{I2}results.append("Step {idx}: {sname} SKIPPED")')
+
+        elif stype == 'CircularPatternFeature':
+            qty = step.get('quantity', 2)
+            prev_feats = [feature_vars[fi] for fi in sorted(feature_vars) if fi < idx and fi > idx - 5][-3:]
+            if prev_feats:
+                lines.append(f"{I2}_body = get_body({comp_var}, '{body_name}') or {comp_var}.bRepBodies.item(0)")
+                lines.append(f"{I2}_cf = None")
+                lines.append(f"{I2}for _fi in range(_body.faces.count):")
+                lines.append(f"{I2}    try:")
+                lines.append(f"{I2}        if _body.faces.item(_fi).geometry.objectType.endswith('Cylinder') and abs(_body.faces.item(_fi).geometry.axis.z)>0.9:")
+                lines.append(f"{I2}            _cf = _body.faces.item(_fi); break")
+                lines.append(f"{I2}    except: pass")
+                lines.append(f"{I2}if _cf:")
+                lines.append(f"{I2}    _pc = adsk.core.ObjectCollection.create()")
+                for fv in prev_feats:
+                    lines.append(f"{I2}    if {fv}: _pc.add({fv})")
+                lines.append(f"{I2}    if _pc.count > 0:")
+                lines.append(f"{I2}        _pi = {comp_var}.features.circularPatternFeatures.createInput(_pc, _cf)")
+                lines.append(f"{I2}        _pi.quantity = VI({qty})")
+                lines.append(f"{I2}        _pi.totalAngle = VI({round(_math.radians(step.get('total_angle', 360)), 6)})")
+                lines.append(f"{I2}        {comp_var}.features.circularPatternFeatures.add(_pi)")
+                lines.append(f'{I2}        results.append("Step {idx}: {sname} x{qty}")')
+                lines.append(f"{I2}    else:")
+                lines.append(f'{I2}        results.append("Step {idx}: {sname} SKIPPED - no features")')
+                lines.append(f"{I2}else:")
+                lines.append(f'{I2}    results.append("Step {idx}: {sname} SKIPPED - no axis")')
+            else:
+                lines.append(f'{I2}results.append("Step {idx}: {sname} SKIPPED")')
+
+        elif stype == 'ConstructionPlane':
+            var = f"plane_{idx}"
+            plane_vars[idx] = var
+            offset = step.get('offset', 0)
+            parent_z = step.get('parent_z', 0)
+            parent = step.get('parent', '')
+            abs_z = (parent_z + offset) if parent == 'face' else offset
+            lines.append(f"{I2}_pi = {comp_var}.constructionPlanes.createInput()")
+            lines.append(f"{I2}_pi.setByOffset({comp_var}.xYConstructionPlane, VI({round(abs_z, 6)}))")
+            lines.append(f"{I2}{var} = {comp_var}.constructionPlanes.add(_pi)")
+            lines.append(f'{I2}{var}.name = "{sname}"')
+            lines.append(f'{I2}results.append("Step {idx}: {sname} z={round(abs_z*10,1)}mm")')
+
+        elif stype == 'Occurrence':
+            cname = step.get('component_name', 'component')
+            # Stay in rootComp — creating sub-components fails in Part Design mode
+            # Bodies will be created in rootComp with the component name as prefix
+            comp_names[cname] = "rootComp"
+            comp_var = "rootComp"
+            lines.append(f'{I2}results.append("Step {idx}: {cname} (bodies in rootComp)")')
+
+        else:
+            lines.append(f'{I2}results.append("Step {idx}: {sname} ({stype}) SKIPPED")')
+
+        lines.append(f"{I}except Exception as _e:")
+        lines.append(f'{I}    results.append(f"Step {idx}: {sname} ERROR - {{_e}}")')
+        lines.append("")
+
+    lines.append(f"{I}print('\\n'.join(results))")
+    lines.append(f"{I}ok = sum(1 for r in results if 'ERROR' not in r and 'FAILED' not in r and 'SKIPPED' not in r)")
+    lines.append(f"{I}print(f'Done! {{ok}}/{{len(results)}} steps succeeded')")
+    lines.append("except Exception as e:")
+    lines.append("    print(f'FATAL: {e}')")
+    lines.append("    import traceback; traceback.print_exc()")
+    return '\n'.join(lines)
+
+
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent | ImageContent]:
     if name == "execute_design":
@@ -1385,7 +1779,18 @@ else:
                         "value": round(p.value, 6)}})
 
     # Roll through timeline step by step
+    # IMPORTANT: roll timeline to each step to get correct profile/edge data
     for ti in range(tl_count):
+        # Roll timeline so this step IS computed (marker at ti+1),
+        # but later steps are not — avoids "Didn't roll editing feature back" errors
+        try:
+            if ti + 1 < tl_count:
+                timeline.moveToIndex(ti + 1)
+            else:
+                timeline.moveToEnd()
+        except:
+            pass
+
         item = timeline.item(ti)
         entity = item.entity
         etype = entity.objectType.split("::")[-1]
@@ -1455,27 +1860,91 @@ else:
                 if ext.extentTwo and hasattr(ext.extentTwo, 'distance'):
                     step["distance2"] = round(ext.extentTwo.distance.value, 4)
                 step["is_symmetric"] = hasattr(ext, 'isSymmetricExtent') and ext.isSymmetricExtent
+                # Capture actual extrude direction relative to world Z
+                # by comparing body BB to sketch plane Z
+                try:
+                    _sk = ext.profile if not hasattr(ext.profile, 'count') else ext.profile.item(0)
+                    _sk_z = _sk.parentSketch.origin.z
+                    _body_bb = ext.bodies.item(0).boundingBox
+                    _body_mid_z = (_body_bb.minPoint.z + _body_bb.maxPoint.z) / 2
+                    step["extrude_goes_up"] = _body_mid_z > _sk_z
+                except:
+                    pass
 
                 # CRITICAL: Identify selected profiles by geometric properties
+                # Timeline is rolled to this step, so profile data is accurate
                 try:
                     profiles_info = []
                     prof = ext.profile
                     # prof can be a single Profile or ObjectCollection
-                    if hasattr(prof, 'count'):
+                    items = []
+                    if hasattr(prof, 'objectType') and 'ObjectCollection' in prof.objectType:
                         for pi in range(prof.count):
-                            p = prof.item(pi)
+                            items.append(prof.item(pi))
+                    elif hasattr(prof, 'count') and not hasattr(prof, 'areaProperties'):
+                        for pi in range(prof.count):
+                            items.append(prof.item(pi))
+                    else:
+                        items.append(prof)
+
+                    for p in items:
+                        try:
                             ap = p.areaProperties()
                             profiles_info.append({{
                                 "area": round(abs(ap.area), 4),
                                 "centroid": [round(ap.centroid.x, 3), round(ap.centroid.y, 3)],
                             }})
-                    elif hasattr(prof, 'areaProperties'):
-                        ap = prof.areaProperties()
-                        profiles_info.append({{
-                            "area": round(abs(ap.area), 4),
-                            "centroid": [round(ap.centroid.x, 3), round(ap.centroid.y, 3)],
-                        }})
+                        except:
+                            pass
                     step["profiles"] = profiles_info
+
+                    # Identify sketch and profile indices
+                    try:
+                        sketch = ext.profile if not items else items[0]
+                        if hasattr(sketch, 'parentSketch'):
+                            sk = sketch.parentSketch
+                        elif hasattr(prof, 'parentSketch'):
+                            sk = prof.parentSketch
+                        else:
+                            sk = None
+                        if sk:
+                            step["sketch_name"] = sk.name
+
+                            # Profile indices — match selected profiles to sketch.profiles by identity
+                            profile_indices = []
+                            for p in items:
+                                matched = False
+                                for spi in range(sk.profiles.count):
+                                    if sk.profiles.item(spi) == p:
+                                        profile_indices.append(spi)
+                                        matched = True
+                                        break
+                                if not matched:
+                                    # Fallback: match by area within same sketch
+                                    try:
+                                        pa = p.areaProperties()
+                                        for spi in range(sk.profiles.count):
+                                            spa = sk.profiles.item(spi).areaProperties()
+                                            if abs(abs(spa.area) - abs(pa.area)) < 0.001 and \
+                                               abs(spa.centroid.x - pa.centroid.x) < 0.01 and \
+                                               abs(spa.centroid.y - pa.centroid.y) < 0.01:
+                                                profile_indices.append(spi)
+                                                break
+                                    except:
+                                        pass
+                            step["profile_indices"] = profile_indices
+
+                            # Sketch plane normal for direction correction
+                            try:
+                                _rp = sk.referencePlane
+                                if hasattr(_rp, 'geometry') and hasattr(_rp.geometry, 'normal'):
+                                    _n = _rp.geometry.normal
+                                    step["sketch_plane_normal"] = [round(_n.x,6), round(_n.y,6), round(_n.z,6)]
+                            except:
+                                pass
+                    except:
+                        pass
+
                 except Exception as pe:
                     step["profiles_error"] = str(pe)
 
@@ -1498,101 +1967,222 @@ else:
                 for esi in range(fil.edgeSets.count):
                     es = fil.edgeSets.item(esi)
                     r = round(es.radius.value, 4)
-                    # Describe edges geometrically
-                    edge_descs = []
-                    for ei in range(es.edges.count):
-                        e = es.edges.item(ei)
-                        try:
-                            sp = e.startVertex.geometry
-                            ep = e.endVertex.geometry
-                            gt = e.geometry.objectType.split("::")[-1]
-                            edge_descs.append({{
-                                "geom_type": gt,
-                                "start": [round(sp.x,2), round(sp.y,2), round(sp.z,2)],
-                                "end": [round(ep.x,2), round(ep.y,2), round(ep.z,2)],
-                            }})
-                        except:
-                            pass
-                    edge_sets.append({{"radius": r, "edges": edge_descs}})
+                    edge_sets.append({{"radius": r}})
                 step["edge_sets"] = edge_sets
+
+                # PRIMARY: Get edge midpoints from edgeSets (exact edge references)
+                edge_midpoints = []
+                try:
+                    for esi in range(fil.edgeSets.count):
+                        es = fil.edgeSets.item(esi)
+                        for ei in range(es.edges.count):
+                            edge = es.edges.item(ei)
+                            ok, pt = edge.evaluator.getPointAtParameter(0.5)
+                            if ok:
+                                edge_midpoints.append([round(pt.x,4), round(pt.y,4), round(pt.z,4)])
+                except:
+                    pass
+                step["edge_midpoints"] = edge_midpoints
+
+                # SECONDARY: Face geometry (fallback if edges unavailable)
+                fillet_faces = []
+                for fi in range(fil.faces.count):
+                    f = fil.faces.item(fi)
+                    bb = f.boundingBox
+                    gt = f.geometry.objectType.split("::")[-1] if f.geometry else "unknown"
+                    fillet_faces.append({{
+                        "geom_type": gt,
+                        "area": round(f.area, 6),
+                        "bb_min": [round(bb.minPoint.x,3), round(bb.minPoint.y,3), round(bb.minPoint.z,3)],
+                        "bb_max": [round(bb.maxPoint.x,3), round(bb.maxPoint.y,3), round(bb.maxPoint.z,3)],
+                    }})
+                step["faces"] = fillet_faces
+
+                try:
+                    if fil.bodies.count > 0:
+                        step["body_name"] = fil.bodies.item(0).name
+                except:
+                    pass
 
             elif isinstance(entity, adsk.fusion.ChamferFeature):
                 ch = entity
                 edge_sets = []
                 for esi in range(ch.edgeSets.count):
                     es = ch.edgeSets.item(esi)
-                    edge_descs = []
-                    for ei in range(es.edges.count):
-                        e = es.edges.item(ei)
-                        try:
-                            sp = e.startVertex.geometry
-                            ep = e.endVertex.geometry
-                            edge_descs.append({{
-                                "start": [round(sp.x,2), round(sp.y,2), round(sp.z,2)],
-                                "end": [round(ep.x,2), round(ep.y,2), round(ep.z,2)],
-                            }})
-                        except:
-                            pass
-                    edge_sets.append({{"distance": round(es.distance.value, 4), "edges": edge_descs}})
+                    edge_sets.append({{"distance": round(es.distance.value, 4)}})
                 step["edge_sets"] = edge_sets
+
+                # PRIMARY: Get edge midpoints from edgeSets
+                edge_midpoints = []
+                try:
+                    for esi in range(ch.edgeSets.count):
+                        es = ch.edgeSets.item(esi)
+                        for ei in range(es.edges.count):
+                            edge = es.edges.item(ei)
+                            ok, pt = edge.evaluator.getPointAtParameter(0.5)
+                            if ok:
+                                edge_midpoints.append([round(pt.x,4), round(pt.y,4), round(pt.z,4)])
+                except:
+                    pass
+                step["edge_midpoints"] = edge_midpoints
+
+                # SECONDARY: Face geometry (fallback)
+                chamfer_faces = []
+                for fi in range(ch.faces.count):
+                    f = ch.faces.item(fi)
+                    bb = f.boundingBox
+                    gt = f.geometry.objectType.split("::")[-1] if f.geometry else "unknown"
+                    chamfer_faces.append({{
+                        "geom_type": gt,
+                        "area": round(f.area, 6),
+                        "bb_min": [round(bb.minPoint.x,3), round(bb.minPoint.y,3), round(bb.minPoint.z,3)],
+                        "bb_max": [round(bb.maxPoint.x,3), round(bb.maxPoint.y,3), round(bb.maxPoint.z,3)],
+                    }})
+                step["faces"] = chamfer_faces
+                try:
+                    if ch.bodies.count > 0:
+                        step["body_name"] = ch.bodies.item(0).name
+                except:
+                    pass
 
             elif isinstance(entity, adsk.fusion.RevolveFeature):
                 rev = entity
                 step["operation"] = int(rev.operation)
                 try:
-                    step["angle"] = round(math.degrees(rev.angle.value), 1)
+                    step["angle"] = round(math.degrees(rev.extentDefinition.angle.value), 1)
                 except:
                     step["angle"] = 360.0
-                # Profile info
+
+                # Profile info + index
                 try:
                     p = rev.profile
-                    if hasattr(p, 'areaProperties'):
-                        ap = p.areaProperties()
+                    _items = [p] if hasattr(p, 'areaProperties') else [p.item(i) for i in range(p.count)]
+                    if _items:
+                        ap = _items[0].areaProperties()
                         step["profile"] = {{
                             "area": round(abs(ap.area), 4),
                             "centroid": [round(ap.centroid.x, 3), round(ap.centroid.y, 3)],
                         }}
+                        # Profile index in parent sketch
+                        _sk = _items[0].parentSketch
+                        if _sk:
+                            step["sketch_name"] = _sk.name
+                            profile_indices = []
+                            for _p in _items:
+                                for _spi in range(_sk.profiles.count):
+                                    if _sk.profiles.item(_spi) == _p:
+                                        profile_indices.append(_spi)
+                                        break
+                            step["profile_indices"] = profile_indices
                 except:
                     pass
-                # Axis description
+
+                # Axis description — try sketch line index first, then geometry
                 try:
                     ax = rev.axis
-                    if hasattr(ax, 'startVertex'):
-                        step["axis_start"] = [round(ax.startVertex.geometry.x,2),
-                                              round(ax.startVertex.geometry.y,2),
-                                              round(ax.startVertex.geometry.z,2)]
-                        step["axis_end"] = [round(ax.endVertex.geometry.x,2),
-                                            round(ax.endVertex.geometry.y,2),
-                                            round(ax.endVertex.geometry.z,2)]
+                    # Try to identify as sketch line with index
+                    if hasattr(ax, 'objectType') and 'SketchLine' in ax.objectType:
+                        try:
+                            _ask = ax.parentSketch
+                            for _ci in range(_ask.sketchCurves.sketchLines.count):
+                                if _ask.sketchCurves.sketchLines.item(_ci) == ax:
+                                    step["axis_sketch_line_index"] = _ci
+                                    step["axis_sketch_name"] = _ask.name
+                                    break
+                        except:
+                            pass
+                    # Geometry-based axis — handle all entity types
+                    if hasattr(ax, 'objectType') and 'BRepFace' in ax.objectType:
+                        # BRepFace — extract cylinder/cone axis from surface geometry
+                        g = ax.geometry
+                        if hasattr(g, 'axis'):
+                            _a = g.axis
+                            step["axis_direction"] = [round(_a.x,4), round(_a.y,4), round(_a.z,4)]
+                            if hasattr(g, 'origin'):
+                                step["axis_origin"] = [round(g.origin.x,4), round(g.origin.y,4), round(g.origin.z,4)]
+                    elif hasattr(ax, 'startVertex'):
+                        step["axis_start"] = [round(ax.startVertex.geometry.x,4),
+                                              round(ax.startVertex.geometry.y,4),
+                                              round(ax.startVertex.geometry.z,4)]
+                        step["axis_end"] = [round(ax.endVertex.geometry.x,4),
+                                            round(ax.endVertex.geometry.y,4),
+                                            round(ax.endVertex.geometry.z,4)]
+                        g = ax.geometry if hasattr(ax, 'geometry') else None
+                        if g:
+                            if hasattr(g, 'startPoint') and hasattr(g, 'endPoint'):
+                                sp, ep = g.startPoint, g.endPoint
+                                step["axis_origin"] = [round(sp.x,4), round(sp.y,4), round(sp.z,4)]
+                                dx, dy, dz = ep.x-sp.x, ep.y-sp.y, ep.z-sp.z
+                                ln = max((dx**2+dy**2+dz**2)**0.5, 1e-10)
+                                step["axis_direction"] = [round(dx/ln,4), round(dy/ln,4), round(dz/ln,4)]
                     elif hasattr(ax, 'geometry'):
                         g = ax.geometry
-                        if hasattr(g, 'origin'):
-                            step["axis_origin"] = [round(g.origin.x,2), round(g.origin.y,2), round(g.origin.z,2)]
-                            step["axis_direction"] = [round(g.direction.x,3), round(g.direction.y,3), round(g.direction.z,3)]
+                        if hasattr(g, 'origin') and hasattr(g, 'direction'):
+                            step["axis_origin"] = [round(g.origin.x,4), round(g.origin.y,4), round(g.origin.z,4)]
+                            step["axis_direction"] = [round(g.direction.x,4), round(g.direction.y,4), round(g.direction.z,4)]
+                        elif hasattr(g, 'startPoint') and hasattr(g, 'endPoint'):
+                            sp, ep = g.startPoint, g.endPoint
+                            step["axis_origin"] = [round(sp.x,4), round(sp.y,4), round(sp.z,4)]
+                            dx, dy, dz = ep.x-sp.x, ep.y-sp.y, ep.z-sp.z
+                            ln = max((dx**2+dy**2+dz**2)**0.5, 1e-10)
+                            step["axis_direction"] = [round(dx/ln,4), round(dy/ln,4), round(dz/ln,4)]
                 except:
                     pass
 
             elif isinstance(entity, adsk.fusion.CircularPatternFeature):
                 cp = entity
-                step["quantity"] = int(cp.quantity.value) if hasattr(cp.quantity, 'value') else int(cp.quantity)
+                try:
+                    step["quantity"] = int(cp.quantity.value) if hasattr(cp.quantity, 'value') else int(cp.quantity)
+                except:
+                    pass
                 try:
                     step["total_angle"] = round(math.degrees(cp.totalAngle.value), 1)
                 except:
                     step["total_angle"] = 360.0
-                # What's being patterned
-                input_names = []
-                for ii in range(cp.inputEntities.count):
-                    ie = cp.inputEntities.item(ii)
-                    input_names.append(ie.objectType.split("::")[-1])
-                step["input_types"] = input_names
-                # Axis
+                # What's being patterned — map to timeline indices
+                # inputEntities will be collected in a separate pass after main loop
+                # (accessing during timeline roll causes "editing" errors)
+                # Axis — handle BRepFace (cylinder axis), BRepEdge, ConstructionAxis
                 try:
                     ax = cp.axis
                     step["axis_type"] = ax.objectType.split("::")[-1]
                     if hasattr(ax, 'geometry'):
                         g = ax.geometry
-                        if hasattr(g, 'direction'):
-                            step["axis_direction"] = [round(g.direction.x,3), round(g.direction.y,3), round(g.direction.z,3)]
+                        # InfiniteLine3D has origin + direction
+                        if hasattr(g, 'origin') and hasattr(g, 'direction'):
+                            step["axis_direction"] = [round(g.direction.x,4), round(g.direction.y,4), round(g.direction.z,4)]
+                            step["axis_origin"] = [round(g.origin.x,4), round(g.origin.y,4), round(g.origin.z,4)]
+                        # Cylinder/Cone has axis property
+                        elif hasattr(g, 'axis'):
+                            _a = g.axis
+                            step["axis_direction"] = [round(_a.x,4), round(_a.y,4), round(_a.z,4)]
+                            if hasattr(g, 'origin'):
+                                step["axis_origin"] = [round(g.origin.x,4), round(g.origin.y,4), round(g.origin.z,4)]
+                        # Line3D has startPoint/endPoint
+                        elif hasattr(g, 'startPoint') and hasattr(g, 'endPoint'):
+                            sp, ep = g.startPoint, g.endPoint
+                            step["axis_origin"] = [round(sp.x,4), round(sp.y,4), round(sp.z,4)]
+                            dx, dy, dz = ep.x-sp.x, ep.y-sp.y, ep.z-sp.z
+                            ln = max((dx**2+dy**2+dz**2)**0.5, 1e-10)
+                            step["axis_direction"] = [round(dx/ln,4), round(dy/ln,4), round(dz/ln,4)]
+                except:
+                    pass
+                # Describe pattern via faces/bodies for reconstruction context
+                try:
+                    pat_faces = []
+                    for fi in range(min(cp.faces.count, 20)):
+                        f = cp.faces.item(fi)
+                        bb = f.boundingBox
+                        pat_faces.append({{
+                            "bb_min": [round(bb.minPoint.x,3), round(bb.minPoint.y,3), round(bb.minPoint.z,3)],
+                            "bb_max": [round(bb.maxPoint.x,3), round(bb.maxPoint.y,3), round(bb.maxPoint.z,3)],
+                        }})
+                    step["faces"] = pat_faces
+                except:
+                    pass
+                try:
+                    if cp.bodies.count > 0:
+                        step["body_name"] = cp.bodies.item(0).name
                 except:
                     pass
 
@@ -1629,24 +2219,97 @@ else:
 
         steps.append(step)
 
+    # Restore timeline to the end
+    try:
+        timeline.moveToEnd()
+    except:
+        pass
+
+    # Second pass: collect CircularPattern input via timeline groups
+    # inputEntities API is broken ("Didn't roll editing feature back")
+    # Instead, use timeline group structure — patterns group their input features
+    for _s in steps:
+        if _s.get("type") != "CircularPatternFeature":
+            continue
+        _pat_ti = _s["index"]
+        try:
+            _pat_item = timeline.item(_pat_ti)
+            # Check if this item is part of a group or is a group
+            input_timeline_indices = []
+            input_types = []
+            # Try parentGroup — pattern may be inside a group with its inputs
+            if hasattr(_pat_item, 'parentGroup') and _pat_item.parentGroup:
+                _grp = _pat_item.parentGroup
+                for _gi in range(_grp.count):
+                    _child = _grp.item(_gi)
+                    if _child.index != _pat_ti:  # skip the pattern itself
+                        try:
+                            _ce = _child.entity
+                            input_timeline_indices.append(_child.index)
+                            input_types.append(_ce.objectType.split("::")[-1])
+                        except:
+                            input_timeline_indices.append(_child.index)
+                            input_types.append("unknown")
+            # If no group found, try: pattern is itself a group containing items
+            if not input_timeline_indices and hasattr(_pat_item, 'isGroup') and _pat_item.isGroup:
+                for _gi in range(_pat_item.count):
+                    _child = _pat_item.item(_gi)
+                    try:
+                        _ce = _child.entity
+                        input_timeline_indices.append(_child.index)
+                        input_types.append(_ce.objectType.split("::")[-1])
+                    except:
+                        input_timeline_indices.append(_child.index)
+                        input_types.append("unknown")
+            _s["input_timeline_indices"] = input_timeline_indices
+            _s["input_types"] = input_types
+        except Exception as _grperr:
+            _s["_input_error"] = str(_grperr)
+
     # Build output
     export = {{"parameters": params, "timeline": steps, "timeline_count": tl_count}}
 
-    # Write to file
-    with open(output_path, "w") as f:
-        f.write("# Fusion 360 Design Export (design_to_python)\\n")
-        f.write("# Generated timeline data with geometric profile/edge descriptions\\n")
-        f.write("# Use this data to generate a reconstruction script\\n\\n")
-        f.write("DESIGN_DATA = ")
-        f.write(json.dumps(export, indent=2, ensure_ascii=False))
-        f.write("\\n")
+    # Write JSON to temp file for server to process
+    tmp_path = output_path + ".tmp.json"
+    with open(tmp_path, "w") as f:
+        f.write(json.dumps(export, ensure_ascii=False))
 
-    print(f"Exported {{tl_count}} timeline steps to {{output_path}}")
+    print(f"Exported {{tl_count}} timeline steps")
     print(f"Parameters: {{len(params)}}")
     print(f"Steps with profiles: {{sum(1 for s in steps if 'profiles' in s)}}")
-    print(f"Steps with edge_sets: {{sum(1 for s in steps if 'edge_sets' in s)}}")
+    edge_steps = [s for s in steps if 'edge_sets' in s]
+    faces_steps = sum(1 for s in steps if 'faces' in s)
+    errors = sum(1 for s in steps if 'error' in s)
+    print(f"Steps with edge_sets: {{len(edge_steps)}} ({{faces_steps}} with face geometry, {{errors}} errors)")
+    print(f"JSON_PATH:{{tmp_path}}")
 '''
         result = await _send_to_fusion(export_code, render=False, timeout=120)
+
+        # Read the JSON data and generate reconstruction script
+        tmp_path = output_path + ".tmp.json"
+        try:
+            import json
+            with open(tmp_path, 'r') as f:
+                design_data = json.load(f)
+            # Keep JSON for debugging: os.remove(tmp_path)
+
+            script = _generate_reconstruction_script(design_data)
+            with open(output_path, 'w') as f:
+                f.write(f"# Fusion 360 Reconstruction Script (auto-generated by design_to_python)\n")
+                f.write(f"# Timeline steps: {design_data.get('timeline_count', '?')}\n")
+                f.write(f"# Parameters: {len(design_data.get('parameters', []))}\n\n")
+                f.write(script)
+
+            # Add script info to response
+            result_text = result.get("output", "") if isinstance(result, dict) else str(result)
+            result_text += f"\nGenerated reconstruction script: {output_path}"
+            if isinstance(result, dict):
+                result['output'] = result_text
+        except Exception as e:
+            # Fallback: write JSON data directly
+            if isinstance(result, dict):
+                result['output'] = result.get('output', '') + f"\nScript generation error: {e}. JSON saved to {tmp_path}"
+
         return _build_response(result)
 
     else:
