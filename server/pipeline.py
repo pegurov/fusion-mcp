@@ -29,72 +29,118 @@ def ensure_dirs():
 
 def get_init_reconstruction_code() -> str:
     """Return Fusion code that:
-    1. Records current document as 'original'
-    2. Creates a new empty document 'Reconstruction'
-    3. Records it as 'reconstruction'
+    1. Identifies the original document (has bodies named 'case'/'cylinder'/'lid')
+    2. Closes ALL other documents
+    3. Creates a fresh empty reconstruction document
     4. Activates the reconstruction document
+    Result: exactly 2 tabs — original (left) + reconstruction (right)
     """
-    doc_roles_path = str(DOC_ROLES_FILE)
-    return f'''
+    return '''
 import json, os
 
-_roles_path = r"{doc_roles_path}"
-os.makedirs(os.path.dirname(_roles_path), exist_ok=True)
+# Step 1: Find documents WITH and WITHOUT the _recon marker
+_original = None
+_recon_docs = []
+for _di in range(app.documents.count):
+    _doc = app.documents.item(_di)
+    try:
+        _d = _doc.products.itemByProductType('DesignProductType')
+        if _d:
+            _has_marker = False
+            try:
+                _has_marker = (_d.userParameters.itemByName("_recon") is not None)
+            except:
+                pass
+            if _has_marker:
+                _recon_docs.append(_doc)
+            else:
+                if _original is None:
+                    _original = _doc
+    except:
+        pass
 
-# Record original
-_orig_doc = app.activeDocument
-_orig_name = _orig_doc.name
-print(f"Original document: {{_orig_name}}")
+if not _original:
+    _original = app.activeDocument
+    print("WARNING: no unmarked document found, using active")
 
-# Create new reconstruction document
+# Step 2: Activate original, close everything else
+_original.activate()
+_closed = 0
+while app.documents.count > 1:
+    _found = False
+    for _di in range(app.documents.count):
+        _doc = app.documents.item(_di)
+        if _doc != _original:
+            try:
+                _doc.close(False)
+                _closed += 1
+                _found = True
+                break
+            except:
+                pass
+    if not _found:
+        break
+if _closed:
+    print(f"Closed {_closed} stale documents")
+
+# Step 3: Create fresh reconstruction document with _recon marker
 _new_doc = app.documents.add(adsk.core.DocumentTypes.FusionDesignDocumentType)
-# Set design type to parametric
 _new_design = adsk.fusion.Design.cast(_new_doc.products.itemByProductType('DesignProductType'))
 if _new_design:
     _new_design.designType = adsk.fusion.DesignTypes.ParametricDesignType
+    _new_design.userParameters.add("_recon", adsk.core.ValueInput.createByString("1"), "", "")
 
-_recon_name = _new_doc.name
-print(f"Reconstruction document: {{_recon_name}}")
-
-# Save roles mapping
-_roles = {{
-    "original": _orig_name,
-    "reconstruction": _recon_name,
-}}
-with open(_roles_path, "w") as _f:
-    json.dump(_roles, _f, indent=2)
-
-print(f"Roles saved to {{_roles_path}}")
-print(f"Active document: {{app.activeDocument.name}}")
+_orig_d = adsk.fusion.Design.cast(_original.products.itemByProductType('DesignProductType'))
+_orig_tl = _orig_d.timeline.count if _orig_d else 0
+print(f"Original: tl={_orig_tl}")
+print(f"Reconstruction: fresh (marked)")
+print(f"Tabs: {app.documents.count}")
 '''
 
 
 def get_switch_document_code(role: str) -> str:
-    """Return Fusion code that switches to the document with the given role."""
-    doc_roles_path = str(DOC_ROLES_FILE)
+    """Return Fusion code that switches to the document with the given role.
+    Identifies documents by CONTENT, not name:
+    - 'original' = document with body named 'case' or timeline >= 40
+    - 'reconstruction' = the other document (not original)
+    """
     return f'''
-import json
+# Find documents by _recon marker parameter
+_original = None
+_reconstruction = None
+for _di in range(app.documents.count):
+    _doc = app.documents.item(_di)
+    try:
+        _d = _doc.products.itemByProductType('DesignProductType')
+        if _d:
+            _has_marker = False
+            try:
+                _has_marker = (_d.userParameters.itemByName("_recon") is not None)
+            except:
+                pass
+            if _has_marker:
+                _reconstruction = _doc
+            elif _original is None:
+                _original = _doc
+    except:
+        pass
 
-_roles_path = r"{doc_roles_path}"
-with open(_roles_path, "r") as _f:
-    _roles = json.load(_f)
+_role = "{role}"
+if _role == "original":
+    if _original:
+        _original.activate()
+        print(f"Switched to {{_original.name}} (role: original)")
+    else:
+        print("ERROR: Original document not found")
+elif _role == "reconstruction":
+    if _reconstruction:
+        _reconstruction.activate()
+        print(f"Switched to {{_reconstruction.name}} (role: reconstruction)")
+    else:
+        print("ERROR: Reconstruction document not found (no _recon marker). Run init_reconstruction.")
 
-_target_name = _roles.get("{role}")
-if not _target_name:
-    print(f"ERROR: Role '{role}' not found in {{_roles_path}}")
-else:
-    _found = False
-    for _di in range(app.documents.count):
-        _doc = app.documents.item(_di)
-        if _doc.name == _target_name:
-            _doc.activate()
-            _found = True
-            print(f"Switched to {{_doc.name}} (role: {role})")
-            break
-    if not _found:
-        print(f"ERROR: Document '{{_target_name}}' not found. Available:")
-        for _di in range(app.documents.count):
-            print(f"  - {{app.documents.item(_di).name}}")
+if app.documents.count > 2:
+    print(f"WARNING: {{app.documents.count}} tabs open (expected 2). Run init_reconstruction to clean up.")
 '''
 
 

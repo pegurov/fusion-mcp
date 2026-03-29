@@ -445,6 +445,10 @@ def get_tool_definitions() -> list[Tool]:
                         "type": "integer",
                         "description": "Only test up to this step index (inclusive). Default: all saved steps.",
                     },
+                    "regenerate": {
+                        "type": "boolean",
+                        "description": "If true, regenerate step codes using current generator instead of replaying saved codes. Default false.",
+                    },
                 },
             },
         ),
@@ -667,32 +671,31 @@ async def _handle_get_viewport(send_to_fusion, read_image_as_base64):
 
 async def _handle_clear_design(send_to_fusion, read_image_as_base64):
     clear_code = """
-# Remove all occurrences (bodies) from root component
-bodies = rootComp.bRepBodies
-for i in range(bodies.count - 1, -1, -1):
-    bodies.item(i).deleteMe()
-
-# Remove all sketches
-sketches = rootComp.sketches
-for i in range(sketches.count - 1, -1, -1):
-    sketches.item(i).deleteMe()
-
-# Remove all occurrences (sub-components)
-occs = rootComp.occurrences
-for i in range(occs.count - 1, -1, -1):
-    occs.item(i).deleteMe()
-
-# Clear timeline
+# Delete timeline items from END to START (avoids dependency issues)
 timeline = design.timeline
-if timeline.count > 0:
-    timeline.moveToBeginning()
-    for i in range(timeline.count - 1, -1, -1):
-        try:
-            timeline.item(i).deleteMe()
-        except:
-            pass
+_deleted = 0
+for i in range(timeline.count - 1, -1, -1):
+    try:
+        timeline.item(i).entity.deleteMe()
+        _deleted += 1
+    except:
+        pass
 
-print(f"Design cleared.")
+# Clean up any remaining bodies/sketches/occurrences
+for i in range(rootComp.occurrences.count - 1, -1, -1):
+    try: rootComp.occurrences.item(i).deleteMe()
+    except: pass
+for i in range(rootComp.bRepBodies.count - 1, -1, -1):
+    try: rootComp.bRepBodies.item(i).deleteMe()
+    except: pass
+for i in range(rootComp.sketches.count - 1, -1, -1):
+    try: rootComp.sketches.item(i).deleteMe()
+    except: pass
+for i in range(rootComp.constructionPlanes.count - 1, -1, -1):
+    try: rootComp.constructionPlanes.item(i).deleteMe()
+    except: pass
+
+print(f"Design cleared. Deleted {_deleted} timeline items. Remaining: {design.timeline.count}")
 """
     result = await send_to_fusion(clear_code, render=True)
     contents = []
@@ -835,7 +838,55 @@ print(_json.dumps(_report, indent=2, ensure_ascii=False))
     return contents
 
 
+async def _ensure_document_role(role: str, send_to_fusion):
+    """Ensure the active Fusion document matches the expected role.
+    Identifies documents by CONTENT (body names, timeline count), not by name.
+    Returns (ok, message)."""
+    # Check current document by _recon marker parameter
+    check_code = '''
+_has_recon = False
+try:
+    _has_recon = (design.userParameters.itemByName("_recon") is not None)
+except:
+    pass
+_is_original = not _has_recon
+print(f"__IS_ORIGINAL__={'1' if _is_original else '0'}")
+print(f"__DOC_COUNT__={app.documents.count}")
+'''
+    result = await send_to_fusion(check_code, render=False, timeout=10)
+    output = result.get("output", "")
+    is_original = False
+    doc_count = 1
+    for line in output.split("\n"):
+        if line.startswith("__IS_ORIGINAL__="):
+            is_original = line.split("=", 1)[1].strip() == "1"
+        if line.startswith("__DOC_COUNT__="):
+            doc_count = int(line.split("=", 1)[1].strip())
+
+    # Check if already on the right document
+    if (role == "original" and is_original) or (role == "reconstruction" and not is_original):
+        return True, ""
+
+    if doc_count < 2:
+        return False, f"Only {doc_count} document open. Run init_reconstruction first."
+
+    # Wrong document — switch using content-based identification
+    pipeline = _hot_reload_module('pipeline')
+    switch_code = pipeline.get_switch_document_code(role)
+    switch_result = await send_to_fusion(switch_code, render=False, timeout=10)
+    switch_output = switch_result.get("output", "")
+    if "ERROR" in switch_output:
+        return False, f"Failed to switch to {role}: {switch_output}"
+    return True, f"Auto-switched to {role}"
+
+
 async def _handle_undo(arguments, send_to_fusion, read_image_as_base64):
+    # Safety: ensure we're on reconstruction document
+    ok, msg = await _ensure_document_role("reconstruction", send_to_fusion)
+    if not ok:
+        return [TextContent(type="text", text=f"Document switch failed: {msg}")]
+    if msg:
+        pass  # auto-switched document
     count = arguments.get("count", 1)
     to_index = arguments.get("to_index")
 
@@ -1472,6 +1523,13 @@ def _hot_reload_module(name):
 async def _handle_init_reconstruction(send_to_fusion, read_image_as_base64):
     pipeline = _hot_reload_module('pipeline')
     pipeline.ensure_dirs()
+    # Clean stale context and step codes from previous runs
+    import glob
+    ctx_file = pipeline.CONTEXT_FILE
+    if ctx_file.exists():
+        ctx_file.unlink()
+    for f in pipeline.RECONSTRUCTION_DIR.glob("step_*_code.py"):
+        f.unlink()
     code = pipeline.get_init_reconstruction_code()
     result = await send_to_fusion(code, render=True)
     return _build_response(result, read_image_as_base64)
@@ -1486,6 +1544,13 @@ async def _handle_switch_document(arguments, send_to_fusion, read_image_as_base6
 
 
 async def _handle_reconstruct_step(arguments, send_to_fusion, read_image_as_base64):
+    # Safety: ensure we're on reconstruction document
+    ok, msg = await _ensure_document_role("reconstruction", send_to_fusion)
+    if not ok:
+        return [TextContent(type="text", text=f"Document switch failed: {msg}")]
+    if msg:
+        pass  # auto-switched document
+
     pipeline = _hot_reload_module('pipeline')
     generator = _hot_reload_module('generator')
 
@@ -1503,16 +1568,7 @@ async def _handle_reconstruct_step(arguments, send_to_fusion, read_image_as_base
         if s:
             all_steps.append(s)
 
-    # Load or create reconstruction context
-    ctx_dict = pipeline.load_context()
-    if ctx_dict:
-        ctx = generator.ReconstructionContext.from_dict(ctx_dict)
-    else:
-        ctx = generator.ReconstructionContext()
-
-    # For per-step reconstruction, we need the construction data (not just ground truth metrics).
-    # The construction data comes from design_to_python export.
-    # Check if we have the full export JSON
+    # Load design export (needed for context rebuild and step data)
     export_json_path = os.path.expanduser("~/Desktop/design_export.py.tmp.json")
     if not os.path.exists(export_json_path):
         return [TextContent(type="text", text=(
@@ -1527,13 +1583,23 @@ async def _handle_reconstruct_step(arguments, send_to_fusion, read_image_as_base
     if step_index >= len(timeline):
         return [TextContent(type="text", text=f"Step {step_index} out of range (timeline has {len(timeline)} steps)")]
 
+    # Load or rebuild reconstruction context
+    ctx_dict = pipeline.load_context()
+    if ctx_dict:
+        ctx = generator.ReconstructionContext.from_dict(ctx_dict)
+    else:
+        # Rebuild context by running through all previous steps (code gen only, no execution)
+        ctx = generator.ReconstructionContext()
+        for i in range(step_index):
+            generator.generate_single_step(timeline[i], ctx, timeline)
+
     step = timeline[step_index]
 
     # Generate code for this step
     code = generator.generate_single_step(step, ctx, timeline)
 
-    # Execute in Fusion
-    result = await send_to_fusion(code, render=True, timeout=60)
+    # Execute in Fusion (no render — verify_step will render on FAIL if needed)
+    result = await send_to_fusion(code, render=False, timeout=60)
 
     # If successful, save code and context
     output = result.get("output", "")
@@ -1554,14 +1620,17 @@ async def _handle_reconstruct_step(arguments, send_to_fusion, read_image_as_base
         parts.append(f"Step {step_index} executed (no output).")
     contents.append(TextContent(type="text", text="\n\n".join(parts)))
 
-    if result.get("render_path"):
-        img_data = read_image_as_base64(result["render_path"])
-        if img_data:
-            contents.append(ImageContent(type="image", data=img_data, mimeType="image/png"))
-            try:
-                os.unlink(result["render_path"])
-            except OSError:
-                pass
+    # Only render on ERROR for debugging (saves ~50-100k tokens per successful step)
+    if error:
+        err_render = await send_to_fusion("pass", render=True, timeout=10)
+        if err_render.get("render_path"):
+            img_data = read_image_as_base64(err_render["render_path"])
+            if img_data:
+                contents.append(ImageContent(type="image", data=img_data, mimeType="image/png"))
+                try:
+                    os.unlink(err_render["render_path"])
+                except OSError:
+                    pass
 
     return contents
 
@@ -1569,46 +1638,73 @@ async def _handle_reconstruct_step(arguments, send_to_fusion, read_image_as_base
 async def _handle_regression_test(arguments, send_to_fusion, read_image_as_base64):
     pipeline = _hot_reload_module('pipeline')
     verifier = _hot_reload_module('verifier')
+    generator = _hot_reload_module('generator')
 
     up_to_step = arguments.get("up_to_step")
-    completed = pipeline.get_completed_steps()
+    regenerate = arguments.get("regenerate", False)
 
-    if not completed:
-        return [TextContent(type="text", text="No saved step codes found. Run reconstruct_step first.")]
-
-    if up_to_step is not None:
-        completed = [s for s in completed if s <= up_to_step]
+    if regenerate:
+        # Regenerate mode: use current generator to create fresh code for each step
+        import json
+        export_path = pipeline.EXCHANGE_DIR / "design_export.json"
+        if not export_path.exists():
+            export_path = Path.home() / "Desktop" / "design_export.py.tmp.json"
+        with open(str(export_path)) as f:
+            export_data = json.load(f)
+        timeline = export_data.get("timeline", [])
+        max_step = len(timeline) - 1
+        if up_to_step is not None:
+            max_step = min(max_step, up_to_step)
+        completed = list(range(max_step + 1))
+    else:
+        completed = pipeline.get_completed_steps()
+        if not completed:
+            return [TextContent(type="text", text="No saved step codes found. Run reconstruct_step first or use regenerate=true.")]
+        if up_to_step is not None:
+            completed = [s for s in completed if s <= up_to_step]
 
     # 1. Clear design
     clear_code = """
-bodies = rootComp.bRepBodies
-for i in range(bodies.count - 1, -1, -1):
-    bodies.item(i).deleteMe()
-sketches = rootComp.sketches
-for i in range(sketches.count - 1, -1, -1):
-    sketches.item(i).deleteMe()
-occs = rootComp.occurrences
-for i in range(occs.count - 1, -1, -1):
-    occs.item(i).deleteMe()
 timeline = design.timeline
-if timeline.count > 0:
-    timeline.moveToBeginning()
-    for i in range(timeline.count - 1, -1, -1):
-        try:
-            timeline.item(i).deleteMe()
-        except:
-            pass
-print("Design cleared for regression test.")
+_deleted = 0
+for i in range(timeline.count - 1, -1, -1):
+    try:
+        timeline.item(i).entity.deleteMe()
+        _deleted += 1
+    except:
+        pass
+for i in range(rootComp.occurrences.count - 1, -1, -1):
+    try: rootComp.occurrences.item(i).deleteMe()
+    except: pass
+for i in range(rootComp.bRepBodies.count - 1, -1, -1):
+    try: rootComp.bRepBodies.item(i).deleteMe()
+    except: pass
+for i in range(rootComp.sketches.count - 1, -1, -1):
+    try: rootComp.sketches.item(i).deleteMe()
+    except: pass
+for i in range(rootComp.constructionPlanes.count - 1, -1, -1):
+    try: rootComp.constructionPlanes.item(i).deleteMe()
+    except: pass
+print(f"Cleared {_deleted} items. Remaining: {design.timeline.count}")
 """
     await send_to_fusion(clear_code, render=False)
 
     # 2. Execute each step and verify
     results = []
+    ctx = generator.ReconstructionContext() if regenerate else None
+
     for step_idx in completed:
-        code = pipeline.load_step_code(step_idx)
-        if not code:
-            results.append(f"Step {step_idx}: SKIP (no saved code)")
-            continue
+        if regenerate:
+            # Generate fresh code using current generator
+            step = timeline[step_idx]
+            code = generator.generate_single_step(step, ctx, timeline)
+            # Save the fresh code
+            pipeline.save_step_code(step_idx, code)
+        else:
+            code = pipeline.load_step_code(step_idx)
+            if not code:
+                results.append(f"Step {step_idx}: SKIP (no saved code)")
+                continue
 
         # Execute
         exec_result = await send_to_fusion(code, render=False, timeout=60)
@@ -1644,13 +1740,20 @@ async def _handle_export_step_snapshots(arguments, send_to_fusion, read_image_as
 
 
 async def _handle_verify_step(arguments, send_to_fusion, read_image_as_base64):
+    # Safety: ensure we're on reconstruction document
+    ok, msg = await _ensure_document_role("reconstruction", send_to_fusion)
+    if not ok:
+        return [TextContent(type="text", text=f"Document switch failed: {msg}")]
+    if msg:
+        pass  # auto-switched document
+
     verifier = _hot_reload_module('verifier')
 
     step_index = arguments["step_index"]
 
-    # Extract current state from Fusion
+    # Extract current state from Fusion (no render yet — save tokens on PASS)
     code = verifier.get_current_state_code()
-    result = await send_to_fusion(code, render=True)
+    result = await send_to_fusion(code, render=False)
 
     output = result.get("output", "")
     current_state = verifier.parse_current_state_from_output(output)
@@ -1666,15 +1769,17 @@ async def _handle_verify_step(arguments, send_to_fusion, read_image_as_base64):
 
     contents = [TextContent(type="text", text=verification["summary"])]
 
-    # Include render for visual inspection
-    if result.get("render_path"):
-        img_data = read_image_as_base64(result["render_path"])
-        if img_data:
-            contents.append(ImageContent(type="image", data=img_data, mimeType="image/png"))
-            try:
-                os.unlink(result["render_path"])
-            except OSError:
-                pass
+    # Only render on FAIL for visual debugging (saves ~50-100k tokens per PASS)
+    if verification.get("status") != "PASS":
+        fail_render = await send_to_fusion("pass", render=True, timeout=10)
+        if fail_render.get("render_path"):
+            img_data = read_image_as_base64(fail_render["render_path"])
+            if img_data:
+                contents.append(ImageContent(type="image", data=img_data, mimeType="image/png"))
+                try:
+                    os.unlink(fail_render["render_path"])
+                except OSError:
+                    pass
 
     return contents
 
@@ -1777,14 +1882,23 @@ else:
         entity = item.entity
         etype = entity.objectType.split("::")[-1]
         step = {{"index": ti, "name": item.name, "type": etype}}
+        try:
+            if hasattr(entity, 'parentComponent') and entity.parentComponent:
+                _pc = entity.parentComponent
+                if _pc != rootComp:
+                    step["parent_component"] = _pc.name
+        except:
+            pass
 
         try:
             if isinstance(entity, adsk.fusion.Sketch):
                 sk = entity
                 rp = sk.referencePlane
                 try:
-                    _st = sk.transform.translation
-                    step["plane_origin"] = [round(_st.x,4), round(_st.y,4), round(_st.z,4)]
+                    _st = sk.transform
+                    step["plane_origin"] = [round(_st.translation.x,4), round(_st.translation.y,4), round(_st.translation.z,4)]
+                    # Export sketch X-axis for face-based sketch orientation
+                    step["sketch_x_axis"] = [round(_st.getCell(0,0),4), round(_st.getCell(1,0),4), round(_st.getCell(2,0),4)]
                 except:
                     try:
                         if hasattr(rp, 'geometry') and hasattr(rp.geometry, 'origin'):
@@ -1825,23 +1939,35 @@ else:
                     c = sk.sketchCurves.item(ci)
                     ct = c.objectType.split("::")[-1]
                     cd = {{"type": ct, "construction": c.isConstruction}}
+                    _CP = 8  # coordinate precision for sketch curves
                     if isinstance(c, adsk.fusion.SketchLine):
                         sp = c.startSketchPoint.geometry
                         ep = c.endSketchPoint.geometry
-                        cd["start"] = [round(sp.x,4), round(sp.y,4)]
-                        cd["end"] = [round(ep.x,4), round(ep.y,4)]
+                        cd["start"] = [round(sp.x,_CP), round(sp.y,_CP)]
+                        cd["end"] = [round(ep.x,_CP), round(ep.y,_CP)]
                     elif isinstance(c, adsk.fusion.SketchCircle):
                         cp = c.centerSketchPoint.geometry
-                        cd["center"] = [round(cp.x,4), round(cp.y,4)]
-                        cd["radius"] = round(c.radius, 4)
+                        cd["center"] = [round(cp.x,_CP), round(cp.y,_CP)]
+                        cd["radius"] = round(c.radius, _CP)
                     elif isinstance(c, adsk.fusion.SketchArc):
                         cp = c.centerSketchPoint.geometry
                         sp = c.startSketchPoint.geometry
                         ep = c.endSketchPoint.geometry
-                        cd["center"] = [round(cp.x,4), round(cp.y,4)]
-                        cd["radius"] = round(c.radius, 4)
-                        cd["start"] = [round(sp.x,4), round(sp.y,4)]
-                        cd["end"] = [round(ep.x,4), round(ep.y,4)]
+                        cd["center"] = [round(cp.x,_CP), round(cp.y,_CP)]
+                        cd["radius"] = round(c.radius, _CP)
+                        cd["start"] = [round(sp.x,_CP), round(sp.y,_CP)]
+                        cd["end"] = [round(ep.x,_CP), round(ep.y,_CP)]
+                        # Export midpoint for sweep disambiguation (±π ambiguity)
+                        try:
+                            _geo = c.geometry
+                            _ev = _geo.evaluator
+                            _ok2, _ps, _pe = _ev.getParameterExtents()
+                            if _ok2:
+                                _ok3, _mp = _ev.getPointAtParameter((_ps+_pe)/2)
+                                if _ok3:
+                                    cd["mid"] = [round(_mp.x,_CP), round(_mp.y,_CP)]
+                        except:
+                            pass
                     curves.append(cd)
                 step["curves"] = curves
 
@@ -1948,33 +2074,115 @@ else:
                 step["edge_sets"] = edge_sets
                 edge_descriptors = []
                 try:
+                    # Compute original edge positions from adjacent face geometry
+                    _fillet_bbs = []
                     _fillet_tids = set()
                     for _fi in range(fil.faces.count):
                         _fillet_tids.add(fil.faces.item(_fi).tempId)
                     for _fi in range(fil.faces.count):
                         _ff = fil.faces.item(_fi)
-                        _adj = []
-                        _seen = set()
-                        for _ei in range(_ff.edges.count):
-                            _edge = _ff.edges.item(_ei)
-                            for _afi in range(_edge.faces.count):
-                                _af = _edge.faces.item(_afi)
-                                _tid = _af.tempId
-                                if _tid not in _fillet_tids and _tid not in _seen:
-                                    _seen.add(_tid)
-                                    _adj.append(_describe_face(_af))
-                        if len(_adj) >= 2:
-                            _bb = _ff.boundingBox
-                            _cx = round((_bb.minPoint.x + _bb.maxPoint.x)/2, 4)
-                            _cy = round((_bb.minPoint.y + _bb.maxPoint.y)/2, 4)
-                            _cz = round((_bb.minPoint.z + _bb.maxPoint.z)/2, 4)
-                            edge_descriptors.append({{
-                                "center": [_cx, _cy, _cz],
-                                "face_a": _adj[0],
-                                "face_b": _adj[1],
-                            }})
+                        _fbb = _ff.boundingBox
+                        # Default: BB center
+                        _ex = (_fbb.minPoint.x + _fbb.maxPoint.x) / 2
+                        _ey = (_fbb.minPoint.y + _fbb.maxPoint.y) / 2
+                        _ez = (_fbb.minPoint.z + _fbb.maxPoint.z) / 2
+                        # Determine edge direction (largest BB extent) — don't override that axis
+                        _dx = _fbb.maxPoint.x - _fbb.minPoint.x
+                        _dy = _fbb.maxPoint.y - _fbb.minPoint.y
+                        _dz = _fbb.maxPoint.z - _fbb.minPoint.z
+                        _max_ext = max(_dx, _dy, _dz)
+                        # Collect adjacent plane positions per axis
+                        _px, _py, _pz = [], [], []
+                        _seen_adj = set()
+                        for _ei2 in range(_ff.edges.count):
+                            _edge2 = _ff.edges.item(_ei2)
+                            for _afi in range(_edge2.faces.count):
+                                _af = _edge2.faces.item(_afi)
+                                _atid = _af.tempId
+                                if _atid not in _fillet_tids and _atid not in _seen_adj:
+                                    _seen_adj.add(_atid)
+                                    try:
+                                        _ag = _af.geometry
+                                        if _ag.objectType.split("::")[-1] == "Plane":
+                                            _an = _ag.normal
+                                            _ao = _ag.origin
+                                            if abs(_an.x) > 0.9 and _dx < _max_ext:
+                                                _px.append(_ao.x)
+                                            elif abs(_an.y) > 0.9 and _dy < _max_ext:
+                                                _py.append(_ao.y)
+                                            elif abs(_an.z) > 0.9 and _dz < _max_ext:
+                                                _pz.append(_ao.z)
+                                    except:
+                                        pass
+                        # Pick the plane farthest from BB center (at the BB boundary = original edge)
+                        if _px:
+                            _ex = max(_px, key=lambda v: abs(v - _ex))
+                        if _py:
+                            _ey = max(_py, key=lambda v: abs(v - _ey))
+                        if _pz:
+                            _ez = max(_pz, key=lambda v: abs(v - _ez))
+                        _fillet_bbs.append((_ex, _ey, _ez))
+                    _parent_comp = fil.parentComponent if fil.parentComponent else rootComp
+                    _body_name = None
+                    try:
+                        if fil.bodies.count > 0:
+                            _body_name = fil.bodies.item(0).name
+                    except:
+                        pass
+                    # Roll back to BEFORE fillet to capture original edges
+                    timeline.markerPosition = ti
+                    _body = None
+                    for _bi in range(_parent_comp.bRepBodies.count):
+                        _b = _parent_comp.bRepBodies.item(_bi)
+                        if _body_name and _b.name == _body_name:
+                            _body = _b
+                            break
+                    if _body is None and _parent_comp.bRepBodies.count > 0:
+                        _body = _parent_comp.bRepBodies.item(0)
+                    if _body:
+                        _used = set()
+                        for (_bcx, _bcy, _bcz) in _fillet_bbs:
+                            _best = None
+                            _best_d = 1e9
+                            _best_pt = None
+                            _best_idx = -1
+                            for _ei in range(_body.edges.count):
+                                if _ei in _used:
+                                    continue
+                                _e = _body.edges.item(_ei)
+                                try:
+                                    _, _sp, _ep = _e.evaluator.getParameterExtents()
+                                    _, _mp = _e.evaluator.getPointAtParameter((_sp + _ep) / 2)
+                                    _d = ((_mp.x-_bcx)**2 + (_mp.y-_bcy)**2 + (_mp.z-_bcz)**2) ** 0.5
+                                    if _d < _best_d:
+                                        _best_d = _d
+                                        _best = _e
+                                        _best_pt = _mp
+                                        _best_idx = _ei
+                                except:
+                                    continue
+                            if _best and _best_d < 2.0:
+                                _used.add(_best_idx)
+                                _fa = _best.faces.item(0) if _best.faces.count > 0 else None
+                                _fb = _best.faces.item(1) if _best.faces.count > 1 else None
+                                edge_descriptors.append({{
+                                    "center": [round(_best_pt.x, 4), round(_best_pt.y, 4), round(_best_pt.z, 4)],
+                                    "face_a": _describe_face(_fa) if _fa else None,
+                                    "face_b": _describe_face(_fb) if _fb else None,
+                                }})
+                    # Restore timeline position
+                    if ti + 1 < tl_count:
+                        timeline.markerPosition = ti + 1
+                    else:
+                        timeline.moveToEnd()
                 except:
-                    pass
+                    try:
+                        if ti + 1 < tl_count:
+                            timeline.markerPosition = ti + 1
+                        else:
+                            timeline.moveToEnd()
+                    except:
+                        pass
                 step["edge_descriptors"] = edge_descriptors
                 fillet_faces = []
                 for fi in range(fil.faces.count):
@@ -2003,33 +2211,108 @@ else:
                 step["edge_sets"] = edge_sets
                 edge_descriptors = []
                 try:
+                    _cham_bbs = []
                     _cham_tids = set()
                     for _fi in range(ch.faces.count):
                         _cham_tids.add(ch.faces.item(_fi).tempId)
                     for _fi in range(ch.faces.count):
                         _cf = ch.faces.item(_fi)
-                        _adj = []
-                        _seen = set()
-                        for _ei in range(_cf.edges.count):
-                            _edge = _cf.edges.item(_ei)
-                            for _afi in range(_edge.faces.count):
-                                _af = _edge.faces.item(_afi)
-                                _tid = _af.tempId
-                                if _tid not in _cham_tids and _tid not in _seen:
-                                    _seen.add(_tid)
-                                    _adj.append(_describe_face(_af))
-                        if len(_adj) >= 2:
-                            _bb = _cf.boundingBox
-                            _cx = round((_bb.minPoint.x + _bb.maxPoint.x)/2, 4)
-                            _cy = round((_bb.minPoint.y + _bb.maxPoint.y)/2, 4)
-                            _cz = round((_bb.minPoint.z + _bb.maxPoint.z)/2, 4)
-                            edge_descriptors.append({{
-                                "center": [_cx, _cy, _cz],
-                                "face_a": _adj[0],
-                                "face_b": _adj[1],
-                            }})
+                        _cbb = _cf.boundingBox
+                        _ex = (_cbb.minPoint.x + _cbb.maxPoint.x) / 2
+                        _ey = (_cbb.minPoint.y + _cbb.maxPoint.y) / 2
+                        _ez = (_cbb.minPoint.z + _cbb.maxPoint.z) / 2
+                        _dx = _cbb.maxPoint.x - _cbb.minPoint.x
+                        _dy = _cbb.maxPoint.y - _cbb.minPoint.y
+                        _dz = _cbb.maxPoint.z - _cbb.minPoint.z
+                        _max_ext = max(_dx, _dy, _dz)
+                        _px, _py, _pz = [], [], []
+                        _seen_adj = set()
+                        for _ei2 in range(_cf.edges.count):
+                            _edge2 = _cf.edges.item(_ei2)
+                            for _afi in range(_edge2.faces.count):
+                                _af = _edge2.faces.item(_afi)
+                                _atid = _af.tempId
+                                if _atid not in _cham_tids and _atid not in _seen_adj:
+                                    _seen_adj.add(_atid)
+                                    try:
+                                        _ag = _af.geometry
+                                        if _ag.objectType.split("::")[-1] == "Plane":
+                                            _an = _ag.normal
+                                            _ao = _ag.origin
+                                            if abs(_an.x) > 0.9 and _dx < _max_ext:
+                                                _px.append(_ao.x)
+                                            elif abs(_an.y) > 0.9 and _dy < _max_ext:
+                                                _py.append(_ao.y)
+                                            elif abs(_an.z) > 0.9 and _dz < _max_ext:
+                                                _pz.append(_ao.z)
+                                    except:
+                                        pass
+                        if _px:
+                            _ex = max(_px, key=lambda v: abs(v - _ex))
+                        if _py:
+                            _ey = max(_py, key=lambda v: abs(v - _ey))
+                        if _pz:
+                            _ez = max(_pz, key=lambda v: abs(v - _ez))
+                        _cham_bbs.append((_ex, _ey, _ez))
+                    _parent_comp = ch.parentComponent if ch.parentComponent else rootComp
+                    _body_name = None
+                    try:
+                        if ch.bodies.count > 0:
+                            _body_name = ch.bodies.item(0).name
+                    except:
+                        pass
+                    timeline.markerPosition = ti
+                    _body = None
+                    for _bi in range(_parent_comp.bRepBodies.count):
+                        _b = _parent_comp.bRepBodies.item(_bi)
+                        if _body_name and _b.name == _body_name:
+                            _body = _b
+                            break
+                    if _body is None and _parent_comp.bRepBodies.count > 0:
+                        _body = _parent_comp.bRepBodies.item(0)
+                    if _body:
+                        _used = set()
+                        for (_bcx, _bcy, _bcz) in _cham_bbs:
+                            _best = None
+                            _best_d = 1e9
+                            _best_pt = None
+                            _best_idx = -1
+                            for _ei in range(_body.edges.count):
+                                if _ei in _used:
+                                    continue
+                                _e = _body.edges.item(_ei)
+                                try:
+                                    _, _sp, _ep = _e.evaluator.getParameterExtents()
+                                    _, _mp = _e.evaluator.getPointAtParameter((_sp + _ep) / 2)
+                                    _d = ((_mp.x-_bcx)**2 + (_mp.y-_bcy)**2 + (_mp.z-_bcz)**2) ** 0.5
+                                    if _d < _best_d:
+                                        _best_d = _d
+                                        _best = _e
+                                        _best_pt = _mp
+                                        _best_idx = _ei
+                                except:
+                                    continue
+                            if _best and _best_d < 2.0:
+                                _used.add(_best_idx)
+                                _fa = _best.faces.item(0) if _best.faces.count > 0 else None
+                                _fb = _best.faces.item(1) if _best.faces.count > 1 else None
+                                edge_descriptors.append({{
+                                    "center": [round(_best_pt.x, 4), round(_best_pt.y, 4), round(_best_pt.z, 4)],
+                                    "face_a": _describe_face(_fa) if _fa else None,
+                                    "face_b": _describe_face(_fb) if _fb else None,
+                                }})
+                    if ti + 1 < tl_count:
+                        timeline.markerPosition = ti + 1
+                    else:
+                        timeline.moveToEnd()
                 except:
-                    pass
+                    try:
+                        if ti + 1 < tl_count:
+                            timeline.markerPosition = ti + 1
+                        else:
+                            timeline.moveToEnd()
+                    except:
+                        pass
                 step["edge_descriptors"] = edge_descriptors
                 chamfer_faces = []
                 for fi in range(ch.faces.count):
@@ -2065,6 +2348,14 @@ else:
                             "area": round(abs(ap.area), 4),
                             "centroid": [round(ap.centroid.x, 3), round(ap.centroid.y, 3)],
                         }}
+                        if len(_items) > 1:
+                            step["profiles"] = []
+                            for _pi_item in _items:
+                                _api = _pi_item.areaProperties()
+                                step["profiles"].append({{
+                                    "area": round(abs(_api.area), 4),
+                                    "centroid": [round(_api.centroid.x, 3), round(_api.centroid.y, 3)],
+                                }})
                         _sk = _items[0].parentSketch
                         if _sk:
                             step["sketch_name"] = _sk.name
@@ -2253,7 +2544,66 @@ else:
         except Exception as _grperr:
             _s["_input_error"] = str(_grperr)
 
-    export = {{"parameters": params, "timeline": steps, "timeline_count": tl_count}}
+    # ── Collect visual properties (appearances, materials, opacity, visibility) ──
+    visual = {{"bodies": [], "face_overrides": [], "occurrences": []}}
+    try:
+        # Collect from all components (root + sub-components)
+        def _collect_bodies(comp, comp_path=""):
+            for _bi in range(comp.bRepBodies.count):
+                _b = comp.bRepBodies.item(_bi)
+                _bv = {{"name": _b.name, "component": comp_path}}
+                try:
+                    _bv["volume"] = round(_b.physicalProperties.volume, 6)
+                    _bbb = _b.boundingBox
+                    _bv["bb_min"] = [round(_bbb.minPoint.x,3), round(_bbb.minPoint.y,3), round(_bbb.minPoint.z,3)]
+                    _bv["bb_max"] = [round(_bbb.maxPoint.x,3), round(_bbb.maxPoint.y,3), round(_bbb.maxPoint.z,3)]
+                except:
+                    pass
+                if _b.appearance:
+                    _bv["appearance"] = _b.appearance.name
+                    _bv["appearance_id"] = _b.appearance.id
+                if _b.material:
+                    _bv["material"] = _b.material.name
+                    _bv["material_id"] = _b.material.id
+                if _b.opacity < 1.0:
+                    _bv["opacity"] = round(_b.opacity, 4)
+                if not _b.isVisible:
+                    _bv["visible"] = False
+                visual["bodies"].append(_bv)
+                # Per-face appearance overrides
+                _body_app = _b.appearance.name if _b.appearance else None
+                for _fi in range(_b.faces.count):
+                    _f = _b.faces.item(_fi)
+                    if _f.appearance and _f.appearance.name != _body_app:
+                        _fbb = _f.boundingBox
+                        _fg = _f.geometry
+                        _fgt = _fg.objectType.split("::")[-1] if _fg else "unknown"
+                        visual["face_overrides"].append({{
+                            "body": _b.name,
+                            "component": comp_path,
+                            "appearance": _f.appearance.name,
+                            "appearance_id": _f.appearance.id,
+                            "face_type": _fgt,
+                            "face_area": round(_f.area, 6),
+                            "face_bb_center": [
+                                round((_fbb.minPoint.x+_fbb.maxPoint.x)/2, 3),
+                                round((_fbb.minPoint.y+_fbb.maxPoint.y)/2, 3),
+                                round((_fbb.minPoint.z+_fbb.maxPoint.z)/2, 3)],
+                        }})
+        _collect_bodies(rootComp, "")
+        for _oi in range(rootComp.occurrences.count):
+            _occ = rootComp.occurrences.item(_oi)
+            _comp = _occ.component
+            _collect_bodies(_comp, _comp.name)
+            _ov = {{"component": _comp.name, "visible": _occ.isLightBulbOn}}
+            if _occ.appearance:
+                _ov["appearance"] = _occ.appearance.name
+                _ov["appearance_id"] = _occ.appearance.id
+            visual["occurrences"].append(_ov)
+    except Exception as _ve:
+        visual["_error"] = str(_ve)
+
+    export = {{"parameters": params, "timeline": steps, "timeline_count": tl_count, "visual": visual}}
 
     tmp_path = output_path + ".tmp.json"
     with open(tmp_path, "w") as f:
