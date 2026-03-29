@@ -384,6 +384,29 @@ def get_tool_definitions() -> list[Tool]:
             },
         ),
         Tool(
+            name="open_file",
+            description=(
+                "Open a .f3d file from disk in Fusion 360. "
+                "Imports the file into a new document and activates it. "
+                "Closes all other documents first for a clean state."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Absolute path to the .f3d file.",
+                    },
+                    "close_others": {
+                        "type": "boolean",
+                        "description": "Close all other documents before opening. Default true.",
+                        "default": True,
+                    },
+                },
+                "required": ["file_path"],
+            },
+        ),
+        Tool(
             name="init_reconstruction",
             description=(
                 "Set up two-tab workflow for reconstruction. "
@@ -551,6 +574,8 @@ async def handle_tool(
         return await _handle_highlight(arguments, send_to_fusion, read_image_as_base64)
     elif name == "import_mesh":
         return await _handle_import_mesh(arguments, send_to_fusion, read_image_as_base64)
+    elif name == "open_file":
+        return await _handle_open_file(arguments, send_to_fusion, read_image_as_base64)
     elif name == "init_reconstruction":
         return await _handle_init_reconstruction(send_to_fusion, read_image_as_base64)
     elif name == "switch_document":
@@ -1518,6 +1543,66 @@ def _hot_reload_module(name):
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+async def _handle_open_file(arguments, send_to_fusion, read_image_as_base64):
+    file_path = arguments["file_path"]
+    close_others = arguments.get("close_others", True)
+
+    if not os.path.exists(file_path):
+        return [TextContent(type="text", text=f"File not found: {file_path}")]
+
+    # Import first, then close old docs (closing before import breaks addin context)
+    close_code = ""
+    if close_others:
+        close_code = """
+# Close old documents (keep the newly opened one)
+_closed = 0
+while app.documents.count > 1:
+    _found = False
+    for _di in range(app.documents.count):
+        _d2 = app.documents.item(_di)
+        if _d2 != _doc:
+            try:
+                _d2.close(False)
+                _closed += 1
+                _found = True
+                break
+            except:
+                pass
+    if not _found:
+        break
+if _closed:
+    print(f"Closed {_closed} old documents")
+"""
+
+    code = f'''
+import os
+
+_path = r"{file_path}"
+_im = app.importManager
+_opts = _im.createFusionArchiveImportOptions(_path)
+_doc = _im.importToNewDocument(_opts)
+if _doc:
+    _d = adsk.fusion.Design.cast(_doc.products.itemByProductType('DesignProductType'))
+    _tl = _d.timeline.count if _d else 0
+    _bodies = 0
+    if _d:
+        _rc = _d.rootComponent
+        _bodies = _rc.bRepBodies.count
+        for _oi in range(_rc.allOccurrences.count):
+            _bodies += _rc.allOccurrences.item(_oi).component.bRepBodies.count
+    print(f"Opened: {{os.path.basename(_path)}}")
+    print(f"Timeline: {{_tl}} steps")
+    print(f"Bodies: {{_bodies}}")
+    if _d:
+        print(f"Type: {{'Parametric' if _d.designType == adsk.fusion.DesignTypes.ParametricDesignType else 'Direct'}}")
+    {close_code}
+else:
+    print("ERROR: Failed to open file")
+'''
+    result = await send_to_fusion(code, timeout=60)
+    return _build_response(result, read_image_as_base64)
 
 
 async def _handle_init_reconstruction(send_to_fusion, read_image_as_base64):
