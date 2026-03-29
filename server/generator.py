@@ -190,6 +190,32 @@ def find_edges_by_zone(body, face_bboxes, count):
         coll.add(body.edges.item(ei))
     return coll
 
+def find_edges_by_bb_fallback(body, bboxes):
+    """Match edges to face bboxes by orientation, length, and proximity."""
+    edges = adsk.core.ObjectCollection.create()
+    used = set()
+    for fbb_min, fbb_max in bboxes:
+        fc = [(fbb_min[i]+fbb_max[i])/2 for i in range(3)]
+        fspan = [fbb_max[i]-fbb_min[i] for i in range(3)]
+        dom = fspan.index(max(fspan))
+        flen = fspan[dom]
+        best_e, best_d = None, 1e9
+        for ei in range(body.edges.count):
+            if ei in used: continue
+            ebb = body.edges.item(ei).boundingBox
+            espan = [ebb.maxPoint.x-ebb.minPoint.x, ebb.maxPoint.y-ebb.minPoint.y, ebb.maxPoint.z-ebb.minPoint.z]
+            if espan.index(max(espan)) != dom: continue
+            if abs(espan[dom] - flen) > 0.3: continue
+            mx = (ebb.minPoint.x+ebb.maxPoint.x)/2
+            my = (ebb.minPoint.y+ebb.maxPoint.y)/2
+            mz = (ebb.minPoint.z+ebb.maxPoint.z)/2
+            d = math.sqrt((mx-fc[0])**2+(my-fc[1])**2+(mz-fc[2])**2)
+            if d < best_d: best_e, best_d = ei, d
+        if best_e is not None:
+            edges.add(body.edges.item(best_e))
+            used.add(best_e)
+    return edges
+
 def auto_combine(comp, target_z_min=None, target_z_max=None):
     if comp.bRepBodies.count <= 1:
         return
@@ -533,6 +559,80 @@ def generate_single_step(step: dict, context: ReconstructionContext, all_steps: 
     return '\n'.join(lines)
 
 
+def _generate_edge_feature_code(step, lines, I2, comp_var, body_name, idx, sname):
+    """Generate code for fillet or chamfer — shared edge resolution + feature-specific API."""
+    stype = step.get('type', '')
+    edges_data = step.get('edge_sets', [])
+    edge_descs = step.get('edge_descriptors', [])
+    faces = step.get('faces', [])
+    if not (edges_data and (edge_descs or faces)):
+        lines.append(f'{I2}print("Step {idx}: {sname} SKIPPED - no data")')
+        return
+
+    bboxes = [(f['bb_min'], f['bb_max']) for f in faces if 'bb_min' in f]
+
+    # Edge resolution: descriptors (primary) → BB fallback → zone fallback
+    if edge_descs:
+        n_desc = len(edge_descs)
+        lines.append(f"{I2}_edges = find_edges_by_descriptors({comp_var}, {edge_descs}, '{body_name}')")
+        if bboxes:
+            lines.append(f"{I2}if _edges.count < {n_desc}:")
+            lines.append(f"{I2}    _body = get_body({comp_var}, '{body_name}') or find_body_for_edges({comp_var}, {bboxes}) or {comp_var}.bRepBodies.item(0)")
+            lines.append(f"{I2}    _edges = find_edges_by_bb_fallback(_body, {bboxes})")
+    elif bboxes:
+        lines.append(f"{I2}_body = get_body({comp_var}, '{body_name}') or find_body_for_edges({comp_var}, {bboxes}) or {comp_var}.bRepBodies.item(0)")
+        lines.append(f"{I2}_edges = find_edges_by_zone(_body, {bboxes}, {len(bboxes)})")
+    else:
+        lines.append(f"{I2}_edges = adsk.core.ObjectCollection.create()")
+
+    # Feature-specific creation
+    if stype == 'FilletFeature':
+        r = edges_data[0].get('radius', 0.1)
+        lines.append(f"{I2}if _edges.count > 0:")
+        lines.append(f"{I2}    _fi={comp_var}.features.filletFeatures.createInput()")
+        lines.append(f"{I2}    _fi.addConstantRadiusEdgeSet(_edges, VI({r}), True)")
+        lines.append(f"{I2}    try:")
+        lines.append(f"{I2}        {comp_var}.features.filletFeatures.add(_fi)")
+        lines.append(f'{I2}        print(f"Step {idx}: {sname} r={round(r*10,1)}mm - {{_edges.count}} edges")')
+        lines.append(f"{I2}    except Exception as _fe:")
+        if edge_descs and bboxes:
+            lines.append(f"{I2}        _fb_body = get_body({comp_var}, '{body_name}') or find_body_for_edges({comp_var}, {bboxes}) or {comp_var}.bRepBodies.item(0)")
+            lines.append(f"{I2}        _fb_edges = find_edges_by_zone(_fb_body, {bboxes}, {len(bboxes)})")
+            lines.append(f"{I2}        if _fb_edges.count > 0:")
+            lines.append(f"{I2}            _fi2={comp_var}.features.filletFeatures.createInput()")
+            lines.append(f"{I2}            _fi2.addConstantRadiusEdgeSet(_fb_edges, VI({r}), True)")
+            lines.append(f"{I2}            {comp_var}.features.filletFeatures.add(_fi2)")
+            lines.append(f'{I2}            print(f"Step {idx}: {sname} r={round(r*10,1)}mm - {{_fb_edges.count}} edges (zone fallback)")')
+            lines.append(f"{I2}        else:")
+            lines.append(f'{I2}            raise _fe')
+        else:
+            lines.append(f"{I2}        raise")
+    else:  # ChamferFeature
+        d = edges_data[0].get('distance', 0.1)
+        lines.append(f"{I2}if _edges.count > 0:")
+        lines.append(f"{I2}    _chi={comp_var}.features.chamferFeatures.createInput2()")
+        lines.append(f"{I2}    _chi.chamferEdgeSets.addEqualDistanceChamferEdgeSet(_edges, VI({d}), True)")
+        lines.append(f"{I2}    try:")
+        lines.append(f"{I2}        {comp_var}.features.chamferFeatures.add(_chi)")
+        lines.append(f'{I2}        print(f"Step {idx}: {sname} - {{_edges.count}} edges")')
+        lines.append(f"{I2}    except Exception as _ce:")
+        if edge_descs and bboxes:
+            lines.append(f"{I2}        _fb_body = get_body({comp_var}, '{body_name}') or find_body_for_edges({comp_var}, {bboxes}) or {comp_var}.bRepBodies.item(0)")
+            lines.append(f"{I2}        _fb_edges = find_edges_by_zone(_fb_body, {bboxes}, {len(bboxes)})")
+            lines.append(f"{I2}        if _fb_edges.count > 0:")
+            lines.append(f"{I2}            _chi2={comp_var}.features.chamferFeatures.createInput2()")
+            lines.append(f"{I2}            _chi2.chamferEdgeSets.addEqualDistanceChamferEdgeSet(_fb_edges, VI({d}), True)")
+            lines.append(f"{I2}            {comp_var}.features.chamferFeatures.add(_chi2)")
+            lines.append(f'{I2}            print(f"Step {idx}: {sname} - {{_fb_edges.count}} edges (zone fallback)")')
+            lines.append(f"{I2}        else:")
+            lines.append(f'{I2}            raise _ce')
+        else:
+            lines.append(f"{I2}        raise")
+
+    lines.append(f"{I2}else:")
+    lines.append(f'{I2}    print("Step {idx}: {sname} SKIPPED - no edges found")')
+
+
 def _generate_step_body(step, context, all_steps, lines, I2, comp_var):
     """Generate the body of a single step (shared between single-step and full-script modes)."""
     idx = step['index']
@@ -789,141 +889,8 @@ def _generate_step_body(step, context, all_steps, lines, I2, comp_var):
         lines.append(f'{I2}{cvar}.name = "{cname}"')
         lines.append(f'{I2}print("Step {idx}: {cname} (sub-component)")')
 
-    elif stype == 'FilletFeature':
-        edges_data = step.get('edge_sets', [])
-        edge_descs = step.get('edge_descriptors', [])
-        faces = step.get('faces', [])
-        if edges_data and (edge_descs or faces):
-            r = edges_data[0].get('radius', 0.1)
-            bboxes = [(f['bb_min'], f['bb_max']) for f in faces if 'bb_min' in f]
-            if edge_descs:
-                n_desc = len(edge_descs)
-                lines.append(f"{I2}_edges = find_edges_by_descriptors({comp_var}, {edge_descs}, '{body_name}')")
-                if bboxes:
-                    # Fallback: per-face-BB matching by edge orientation+length+proximity
-                    lines.append(f"{I2}if _edges.count < {n_desc}:")
-                    lines.append(f"{I2}    _body = get_body({comp_var}, '{body_name}') or find_body_for_edges({comp_var}, {bboxes}) or {comp_var}.bRepBodies.item(0)")
-                    lines.append(f"{I2}    _edges = adsk.core.ObjectCollection.create()")
-                    lines.append(f"{I2}    _used_edges = set()")
-                    lines.append(f"{I2}    for _fbb_min, _fbb_max in {bboxes}:")
-                    lines.append(f"{I2}        _fc = [(_fbb_min[i]+_fbb_max[i])/2 for i in range(3)]")
-                    lines.append(f"{I2}        _fspan = [_fbb_max[i]-_fbb_min[i] for i in range(3)]")
-                    lines.append(f"{I2}        _dom = _fspan.index(max(_fspan))")
-                    lines.append(f"{I2}        _flen = _fspan[_dom]")
-                    lines.append(f"{I2}        _best_e, _best_d = None, 1e9")
-                    lines.append(f"{I2}        for _ei in range(_body.edges.count):")
-                    lines.append(f"{I2}            if _ei in _used_edges: continue")
-                    lines.append(f"{I2}            _ebb = _body.edges.item(_ei).boundingBox")
-                    lines.append(f"{I2}            _espan = [_ebb.maxPoint.x-_ebb.minPoint.x, _ebb.maxPoint.y-_ebb.minPoint.y, _ebb.maxPoint.z-_ebb.minPoint.z]")
-                    lines.append(f"{I2}            _e_dom = _espan.index(max(_espan))")
-                    lines.append(f"{I2}            if _e_dom != _dom: continue")
-                    lines.append(f"{I2}            if abs(_espan[_dom] - _flen) > 0.3: continue")
-                    lines.append(f"{I2}            _mx = (_ebb.minPoint.x+_ebb.maxPoint.x)/2")
-                    lines.append(f"{I2}            _my = (_ebb.minPoint.y+_ebb.maxPoint.y)/2")
-                    lines.append(f"{I2}            _mz = (_ebb.minPoint.z+_ebb.maxPoint.z)/2")
-                    lines.append(f"{I2}            _d = math.sqrt((_mx-_fc[0])**2+(_my-_fc[1])**2+(_mz-_fc[2])**2)")
-                    lines.append(f"{I2}            if _d < _best_d: _best_e, _best_d = _ei, _d")
-                    lines.append(f"{I2}        if _best_e is not None:")
-                    lines.append(f"{I2}            _edges.add(_body.edges.item(_best_e))")
-                    lines.append(f"{I2}            _used_edges.add(_best_e)")
-            elif bboxes:
-                n_faces = len(bboxes)
-                lines.append(f"{I2}_body = get_body({comp_var}, '{body_name}') or find_body_for_edges({comp_var}, {bboxes}) or {comp_var}.bRepBodies.item(0)")
-                lines.append(f"{I2}_edges = find_edges_by_zone(_body, {bboxes}, {n_faces})")
-            else:
-                lines.append(f"{I2}_edges = adsk.core.ObjectCollection.create()")
-            lines.append(f"{I2}if _edges.count > 0:")
-            lines.append(f"{I2}    _fi={comp_var}.features.filletFeatures.createInput()")
-            lines.append(f"{I2}    _fi.addConstantRadiusEdgeSet(_edges, VI({r}), True)")
-            lines.append(f"{I2}    try:")
-            lines.append(f"{I2}        {comp_var}.features.filletFeatures.add(_fi)")
-            lines.append(f'{I2}        print(f"Step {idx}: {sname} r={round(r*10,1)}mm - {{_edges.count}} edges")')
-            lines.append(f"{I2}    except Exception as _fe:")
-            if edge_descs and bboxes:
-                n_fb = len(bboxes)
-                lines.append(f"{I2}        _fb_body = get_body({comp_var}, '{body_name}') or find_body_for_edges({comp_var}, {bboxes}) or {comp_var}.bRepBodies.item(0)")
-                lines.append(f"{I2}        _fb_edges = find_edges_by_zone(_fb_body, {bboxes}, {n_fb})")
-                lines.append(f"{I2}        if _fb_edges.count > 0:")
-                lines.append(f"{I2}            _fi2={comp_var}.features.filletFeatures.createInput()")
-                lines.append(f"{I2}            _fi2.addConstantRadiusEdgeSet(_fb_edges, VI({r}), True)")
-                lines.append(f"{I2}            {comp_var}.features.filletFeatures.add(_fi2)")
-                lines.append(f'{I2}            print(f"Step {idx}: {sname} r={round(r*10,1)}mm - {{_fb_edges.count}} edges (BB fallback)")')
-                lines.append(f"{I2}        else:")
-                lines.append(f'{I2}            raise _fe')
-            else:
-                lines.append(f"{I2}        raise")
-            lines.append(f"{I2}else:")
-            lines.append(f'{I2}    print("Step {idx}: {sname} SKIPPED - no edges found")')
-        else:
-            lines.append(f'{I2}print("Step {idx}: {sname} SKIPPED - no data")')
-
-    elif stype == 'ChamferFeature':
-        edges_data = step.get('edge_sets', [])
-        edge_descs = step.get('edge_descriptors', [])
-        faces = step.get('faces', [])
-        if edges_data and (edge_descs or faces):
-            d = edges_data[0].get('distance', 0.1)
-            bboxes = [(f['bb_min'], f['bb_max']) for f in faces if 'bb_min' in f]
-            if edge_descs:
-                n_desc = len(edge_descs)
-                lines.append(f"{I2}_edges = find_edges_by_descriptors({comp_var}, {edge_descs}, '{body_name}')")
-                if bboxes:
-                    # Fallback: per-face-BB matching by edge orientation+length+proximity
-                    lines.append(f"{I2}if _edges.count < {n_desc}:")
-                    lines.append(f"{I2}    _body = get_body({comp_var}, '{body_name}') or find_body_for_edges({comp_var}, {bboxes}) or {comp_var}.bRepBodies.item(0)")
-                    lines.append(f"{I2}    _edges = adsk.core.ObjectCollection.create()")
-                    lines.append(f"{I2}    _used_edges = set()")
-                    lines.append(f"{I2}    for _fbb_min, _fbb_max in {bboxes}:")
-                    lines.append(f"{I2}        _fc = [(_fbb_min[i]+_fbb_max[i])/2 for i in range(3)]")
-                    lines.append(f"{I2}        _fspan = [_fbb_max[i]-_fbb_min[i] for i in range(3)]")
-                    lines.append(f"{I2}        _dom = _fspan.index(max(_fspan))")
-                    lines.append(f"{I2}        _flen = _fspan[_dom]")
-                    lines.append(f"{I2}        _best_e, _best_d = None, 1e9")
-                    lines.append(f"{I2}        for _ei in range(_body.edges.count):")
-                    lines.append(f"{I2}            if _ei in _used_edges: continue")
-                    lines.append(f"{I2}            _ebb = _body.edges.item(_ei).boundingBox")
-                    lines.append(f"{I2}            _espan = [_ebb.maxPoint.x-_ebb.minPoint.x, _ebb.maxPoint.y-_ebb.minPoint.y, _ebb.maxPoint.z-_ebb.minPoint.z]")
-                    lines.append(f"{I2}            _e_dom = _espan.index(max(_espan))")
-                    lines.append(f"{I2}            if _e_dom != _dom: continue")
-                    lines.append(f"{I2}            if abs(_espan[_dom] - _flen) > 0.3: continue")
-                    lines.append(f"{I2}            _mx = (_ebb.minPoint.x+_ebb.maxPoint.x)/2")
-                    lines.append(f"{I2}            _my = (_ebb.minPoint.y+_ebb.maxPoint.y)/2")
-                    lines.append(f"{I2}            _mz = (_ebb.minPoint.z+_ebb.maxPoint.z)/2")
-                    lines.append(f"{I2}            _d = math.sqrt((_mx-_fc[0])**2+(_my-_fc[1])**2+(_mz-_fc[2])**2)")
-                    lines.append(f"{I2}            if _d < _best_d: _best_e, _best_d = _ei, _d")
-                    lines.append(f"{I2}        if _best_e is not None:")
-                    lines.append(f"{I2}            _edges.add(_body.edges.item(_best_e))")
-                    lines.append(f"{I2}            _used_edges.add(_best_e)")
-            elif bboxes:
-                n_faces = len(bboxes)
-                lines.append(f"{I2}_body = get_body({comp_var}, '{body_name}') or find_body_for_edges({comp_var}, {bboxes}) or {comp_var}.bRepBodies.item(0)")
-                lines.append(f"{I2}_edges = find_edges_by_zone(_body, {bboxes}, {n_faces})")
-            else:
-                lines.append(f"{I2}_edges = adsk.core.ObjectCollection.create()")
-            lines.append(f"{I2}if _edges.count > 0:")
-            lines.append(f"{I2}    _chi={comp_var}.features.chamferFeatures.createInput2()")
-            lines.append(f"{I2}    _chi.chamferEdgeSets.addEqualDistanceChamferEdgeSet(_edges, VI({d}), True)")
-            lines.append(f"{I2}    try:")
-            lines.append(f"{I2}        {comp_var}.features.chamferFeatures.add(_chi)")
-            lines.append(f'{I2}        print(f"Step {idx}: {sname} - {{_edges.count}} edges")')
-            lines.append(f"{I2}    except Exception as _ce:")
-            if edge_descs and bboxes:
-                n_fb = len(bboxes)
-                lines.append(f"{I2}        _fb_body = get_body({comp_var}, '{body_name}') or find_body_for_edges({comp_var}, {bboxes}) or {comp_var}.bRepBodies.item(0)")
-                lines.append(f"{I2}        _fb_edges = find_edges_by_zone(_fb_body, {bboxes}, {n_fb})")
-                lines.append(f"{I2}        if _fb_edges.count > 0:")
-                lines.append(f"{I2}            _chi2={comp_var}.features.chamferFeatures.createInput2()")
-                lines.append(f"{I2}            _chi2.chamferEdgeSets.addEqualDistanceChamferEdgeSet(_fb_edges, VI({d}), True)")
-                lines.append(f"{I2}            {comp_var}.features.chamferFeatures.add(_chi2)")
-                lines.append(f'{I2}            print(f"Step {idx}: {sname} - {{_fb_edges.count}} edges (BB fallback)")')
-                lines.append(f"{I2}        else:")
-                lines.append(f'{I2}            raise _ce')
-            else:
-                lines.append(f"{I2}        raise")
-            lines.append(f"{I2}else:")
-            lines.append(f'{I2}    print("Step {idx}: {sname} SKIPPED - no edges found")')
-        else:
-            lines.append(f'{I2}print("Step {idx}: {sname} SKIPPED - no data")')
+    elif stype in ('FilletFeature', 'ChamferFeature'):
+        _generate_edge_feature_code(step, lines, I2, comp_var, body_name, idx, sname)
 
     elif stype == 'RevolveFeature':
         var = f"rev_{idx}"

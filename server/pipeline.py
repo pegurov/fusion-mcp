@@ -12,7 +12,6 @@ import os
 from pathlib import Path
 
 EXCHANGE_DIR = Path.home() / "fusion-mcp" / "exchange"
-DOC_ROLES_FILE = EXCHANGE_DIR / "doc_roles.json"
 RECONSTRUCTION_DIR = EXCHANGE_DIR / "reconstruction"
 SNAPSHOTS_DIR = EXCHANGE_DIR / "snapshots"
 CONTEXT_FILE = RECONSTRUCTION_DIR / "context.json"
@@ -142,14 +141,6 @@ elif _role == "reconstruction":
 if app.documents.count > 2:
     print(f"WARNING: {{app.documents.count}} tabs open (expected 2). Run init_reconstruction to clean up.")
 '''
-
-
-def load_doc_roles() -> dict:
-    """Load document roles mapping."""
-    if DOC_ROLES_FILE.exists():
-        with open(DOC_ROLES_FILE, 'r') as f:
-            return json.load(f)
-    return {}
 
 
 # ---------------------------------------------------------------------------

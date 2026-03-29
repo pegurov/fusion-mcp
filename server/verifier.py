@@ -38,21 +38,78 @@ def ensure_dirs():
 #  Ground truth extraction — Fusion-side code generators
 # ---------------------------------------------------------------------------
 
-def get_snapshot_extraction_code(step_index: int) -> str:
-    """Return Fusion Python code that extracts ground truth metrics at a given timeline step.
+def _metrics_code_block(indent: str = "") -> str:
+    """Return embedded Fusion Python code that collects body + sketch metrics.
 
-    The script:
-    1. Rolls timeline to step_index + 1
-    2. Extracts body metrics (volume, area, bbox, face/edge count)
-    3. Extracts sketch profile counts
-    4. Prints JSON result
+    Expects `rootComp` in scope. Populates `_bodies` and `_sketches` lists.
+    Output has real { } for dicts — safe to embed via f-string interpolation.
     """
+    I = indent
+    # Using regular string with .format() for VOLUME/AREA/BBOX precision,
+    # so { } for Python dict literals pass through unescaped.
+    template = (
+        "{I}_bodies = []\n"
+        "{I}def _collect_bodies(_comp, _prefix=\"\"):\n"
+        "{I}    for _bi in range(_comp.bRepBodies.count):\n"
+        "{I}        _b = _comp.bRepBodies.item(_bi)\n"
+        "{I}        _bb = _b.boundingBox\n"
+        "{I}        try:\n"
+        "{I}            _pp = _b.physicalProperties\n"
+        "{I}            _vol = round(_pp.volume, {vp})\n"
+        "{I}            _area = round(_pp.area, {ap})\n"
+        "{I}        except:\n"
+        "{I}            _vol = 0.0\n"
+        "{I}            _area = 0.0\n"
+        "{I}        _bname = _prefix + _b.name if _prefix else _b.name\n"
+        '{I}        _bodies.append({{\n'
+        '{I}            "name": _bname,\n'
+        '{I}            "volume": _vol,\n'
+        '{I}            "area": _area,\n'
+        '{I}            "bbox_min": [round(_bb.minPoint.x, {bp}), round(_bb.minPoint.y, {bp}), round(_bb.minPoint.z, {bp})],\n'
+        '{I}            "bbox_max": [round(_bb.maxPoint.x, {bp}), round(_bb.maxPoint.y, {bp}), round(_bb.maxPoint.z, {bp})],\n'
+        '{I}            "faces": _b.faces.count,\n'
+        '{I}            "edges": _b.edges.count,\n'
+        "{I}        }})\n"
+        "{I}_collect_bodies(rootComp)\n"
+        "{I}for _oi in range(rootComp.allOccurrences.count):\n"
+        "{I}    _occ = rootComp.allOccurrences.item(_oi)\n"
+        '{I}    _collect_bodies(_occ.component, _occ.component.name + "/")\n'
+        "{I}_sketches = []\n"
+        "{I}for _si in range(rootComp.sketches.count):\n"
+        "{I}    _sk = rootComp.sketches.item(_si)\n"
+        '{I}    _sketches.append({{\n'
+        '{I}        "name": _sk.name,\n'
+        '{I}        "profiles": _sk.profiles.count,\n'
+        '{I}        "curves": _sk.sketchCurves.count,\n'
+        "{I}    }})"
+    )
+    return template.format(I=I, vp=VOLUME_PRECISION, ap=AREA_PRECISION, bp=BBOX_PRECISION)
+
+
+def _totals_code_block(indent: str = "") -> str:
+    """Return embedded code that computes totals from _bodies/_sketches."""
+    I = indent
+    template = (
+        '{I}"body_count": len(_bodies),\n'
+        '{I}"bodies": _bodies,\n'
+        '{I}"sketch_count": len(_sketches),\n'
+        '{I}"sketches": _sketches,\n'
+        '{I}"total_volume": round(sum(_b["volume"] for _b in _bodies), {vp}),\n'
+        '{I}"total_area": round(sum(_b["area"] for _b in _bodies), {ap}),\n'
+        '{I}"total_faces": sum(_b["faces"] for _b in _bodies),\n'
+        '{I}"total_edges": sum(_b["edges"] for _b in _bodies),'
+    )
+    return template.format(I=I, vp=VOLUME_PRECISION, ap=AREA_PRECISION)
+
+
+def get_snapshot_extraction_code(step_index: int) -> str:
+    """Return Fusion Python code that extracts ground truth metrics at a given timeline step."""
+    metrics = _metrics_code_block()
+    totals = _totals_code_block("    ")
     return f'''
 import json
 
 _step_index = {step_index}
-
-# Roll timeline to this step
 timeline = design.timeline
 tl_count = timeline.count
 
@@ -64,55 +121,11 @@ try:
 except Exception as _te:
     print(f"TIMELINE_ERROR: {{_te}}")
 
-# Extract body metrics (root + all sub-components)
-_bodies = []
-def _collect_bodies(_comp, _prefix=""):
-    for _bi in range(_comp.bRepBodies.count):
-        _b = _comp.bRepBodies.item(_bi)
-        _bb = _b.boundingBox
-        try:
-            _pp = _b.physicalProperties
-            _vol = round(_pp.volume, {VOLUME_PRECISION})
-            _area = round(_pp.area, {AREA_PRECISION})
-        except:
-            _vol = 0.0
-            _area = 0.0
-        _bname = _prefix + _b.name if _prefix else _b.name
-        _bodies.append({{
-            "name": _bname,
-            "volume": _vol,
-            "area": _area,
-            "bbox_min": [round(_bb.minPoint.x, {BBOX_PRECISION}), round(_bb.minPoint.y, {BBOX_PRECISION}), round(_bb.minPoint.z, {BBOX_PRECISION})],
-            "bbox_max": [round(_bb.maxPoint.x, {BBOX_PRECISION}), round(_bb.maxPoint.y, {BBOX_PRECISION}), round(_bb.maxPoint.z, {BBOX_PRECISION})],
-            "faces": _b.faces.count,
-            "edges": _b.edges.count,
-        }})
-
-_collect_bodies(rootComp)
-for _oi in range(rootComp.allOccurrences.count):
-    _occ = rootComp.allOccurrences.item(_oi)
-    _collect_bodies(_occ.component, _occ.component.name + "/")
-
-# Extract sketch info (profile counts)
-_sketches = []
-for _si in range(rootComp.sketches.count):
-    _sk = rootComp.sketches.item(_si)
-    _sketches.append({{
-        "name": _sk.name,
-        "profiles": _sk.profiles.count,
-        "curves": _sk.sketchCurves.count,
-    }})
+{metrics}
 
 _result = {{
     "step_index": _step_index,
-    "body_count": len(_bodies),
-    "bodies": _bodies,
-    "sketch_count": len(_sketches),
-    "sketches": _sketches,
-    "total_volume": round(sum(_b["volume"] for _b in _bodies), {VOLUME_PRECISION}),
-    "total_area": round(sum(_b["area"] for _b in _bodies), {AREA_PRECISION}),
-    "total_faces": sum(_b["faces"] for _b in _bodies),
-    "total_edges": sum(_b["edges"] for _b in _bodies),
+{totals}
 }}
 
 print("GROUND_TRUTH_JSON:" + json.dumps(_result, ensure_ascii=False))
@@ -120,12 +133,10 @@ print("GROUND_TRUTH_JSON:" + json.dumps(_result, ensure_ascii=False))
 
 
 def get_full_export_code(total_steps: int) -> str:
-    """Return Fusion code that captures ground truth for ALL steps in one run.
-
-    More efficient than calling get_snapshot_extraction_code per step,
-    as it only needs one Fusion execution.
-    """
+    """Return Fusion code that captures ground truth for ALL steps in one run."""
     snapshots_dir = str(SNAPSHOTS_DIR)
+    metrics = _metrics_code_block("    ")
+    totals = _totals_code_block("        ")
     return f'''
 import json, os
 
@@ -146,60 +157,17 @@ for _ti in range(_total):
         print(f"Step {{_ti}}: timeline error - {{_te}}")
         continue
 
-    _bodies = []
-    def _collect_bodies(_comp, _prefix=""):
-        for _bi in range(_comp.bRepBodies.count):
-            _b = _comp.bRepBodies.item(_bi)
-            _bb = _b.boundingBox
-            try:
-                _pp = _b.physicalProperties
-                _vol = round(_pp.volume, {VOLUME_PRECISION})
-                _area = round(_pp.area, {AREA_PRECISION})
-            except:
-                _vol = 0.0
-                _area = 0.0
-            _bname = _prefix + _b.name if _prefix else _b.name
-            _bodies.append({{
-                "name": _bname,
-                "volume": _vol,
-                "area": _area,
-                "bbox_min": [round(_bb.minPoint.x, {BBOX_PRECISION}), round(_bb.minPoint.y, {BBOX_PRECISION}), round(_bb.minPoint.z, {BBOX_PRECISION})],
-                "bbox_max": [round(_bb.maxPoint.x, {BBOX_PRECISION}), round(_bb.maxPoint.y, {BBOX_PRECISION}), round(_bb.maxPoint.z, {BBOX_PRECISION})],
-                "faces": _b.faces.count,
-                "edges": _b.edges.count,
-            }})
-
-    _collect_bodies(rootComp)
-    for _oi in range(rootComp.allOccurrences.count):
-        _occ = rootComp.allOccurrences.item(_oi)
-        _collect_bodies(_occ.component, _occ.component.name + "/")
-
-    _sketches = []
-    for _si in range(rootComp.sketches.count):
-        _sk = rootComp.sketches.item(_si)
-        _sketches.append({{
-            "name": _sk.name,
-            "profiles": _sk.profiles.count,
-            "curves": _sk.sketchCurves.count,
-        }})
+{metrics}
 
     _snapshot = {{
         "step_index": _ti,
-        "body_count": len(_bodies),
-        "bodies": _bodies,
-        "sketch_count": len(_sketches),
-        "sketches": _sketches,
-        "total_volume": round(sum(_b["volume"] for _b in _bodies), {VOLUME_PRECISION}),
-        "total_area": round(sum(_b["area"] for _b in _bodies), {AREA_PRECISION}),
-        "total_faces": sum(_b["faces"] for _b in _bodies),
-        "total_edges": sum(_b["edges"] for _b in _bodies),
+{totals}
     }}
 
     _path = os.path.join(_snapshots_dir, f"step_{{_ti}}.json")
     with open(_path, "w") as _f:
         json.dump(_snapshot, _f, ensure_ascii=False, indent=2)
 
-# Restore timeline
 try:
     timeline.moveToEnd()
 except:
@@ -210,59 +178,16 @@ print(f"Captured {{_total}} snapshots to {{_snapshots_dir}}")
 
 
 def get_current_state_code() -> str:
-    """Return Fusion code that extracts current design state metrics.
-
-    Used for verification — same format as ground truth snapshots.
-    """
+    """Return Fusion code that extracts current design state metrics."""
+    metrics = _metrics_code_block()
+    totals = _totals_code_block("    ")
     return f'''
 import json
 
-_bodies = []
-def _collect_bodies(_comp, _prefix=""):
-    for _bi in range(_comp.bRepBodies.count):
-        _b = _comp.bRepBodies.item(_bi)
-        _bb = _b.boundingBox
-        try:
-            _pp = _b.physicalProperties
-            _vol = round(_pp.volume, {VOLUME_PRECISION})
-            _area = round(_pp.area, {AREA_PRECISION})
-        except:
-            _vol = 0.0
-            _area = 0.0
-        _bname = _prefix + _b.name if _prefix else _b.name
-        _bodies.append({{
-            "name": _bname,
-            "volume": _vol,
-            "area": _area,
-            "bbox_min": [round(_bb.minPoint.x, {BBOX_PRECISION}), round(_bb.minPoint.y, {BBOX_PRECISION}), round(_bb.minPoint.z, {BBOX_PRECISION})],
-            "bbox_max": [round(_bb.maxPoint.x, {BBOX_PRECISION}), round(_bb.maxPoint.y, {BBOX_PRECISION}), round(_bb.maxPoint.z, {BBOX_PRECISION})],
-            "faces": _b.faces.count,
-            "edges": _b.edges.count,
-        }})
-
-_collect_bodies(rootComp)
-for _oi in range(rootComp.allOccurrences.count):
-    _occ = rootComp.allOccurrences.item(_oi)
-    _collect_bodies(_occ.component, _occ.component.name + "/")
-
-_sketches = []
-for _si in range(rootComp.sketches.count):
-    _sk = rootComp.sketches.item(_si)
-    _sketches.append({{
-        "name": _sk.name,
-        "profiles": _sk.profiles.count,
-        "curves": _sk.sketchCurves.count,
-    }})
+{metrics}
 
 _result = {{
-    "body_count": len(_bodies),
-    "bodies": _bodies,
-    "sketch_count": len(_sketches),
-    "sketches": _sketches,
-    "total_volume": round(sum(_b["volume"] for _b in _bodies), {VOLUME_PRECISION}),
-    "total_area": round(sum(_b["area"] for _b in _bodies), {AREA_PRECISION}),
-    "total_faces": sum(_b["faces"] for _b in _bodies),
-    "total_edges": sum(_b["edges"] for _b in _bodies),
+{totals}
 }}
 
 print("CURRENT_STATE_JSON:" + json.dumps(_result, ensure_ascii=False))
@@ -371,9 +296,11 @@ def verify_step(step_index: int, current_state: dict) -> dict:
             "actual": current_state["total_edges"],
         })
 
-    # Per-body comparison (sorted by volume for stable ordering)
-    gt_bodies = sorted(ground_truth["bodies"], key=lambda b: -b["volume"])
-    cur_bodies = sorted(current_state["bodies"], key=lambda b: -b["volume"])
+    # Per-body comparison (sorted by volume desc, then bbox_min for stable tie-breaking)
+    def _body_sort_key(b):
+        return (-b["volume"], b.get("bbox_min", [0, 0, 0]))
+    gt_bodies = sorted(ground_truth["bodies"], key=_body_sort_key)
+    cur_bodies = sorted(current_state["bodies"], key=_body_sort_key)
 
     for i, gt_body in enumerate(gt_bodies):
         prefix = f"body[{i}]({gt_body['name']})"

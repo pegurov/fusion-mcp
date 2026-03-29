@@ -1869,6 +1869,135 @@ else:
             pass
         return d
 
+    def _extract_edge_descriptors(feature, timeline, ti, tl_count, rootComp):
+        """Shared: extract edge descriptors for fillet/chamfer via timeline rollback + plane intersection."""
+        edge_descriptors = []
+        try:
+            _bbs = []
+            _feature_tids = set()
+            for _fi in range(feature.faces.count):
+                _feature_tids.add(feature.faces.item(_fi).tempId)
+            for _fi in range(feature.faces.count):
+                _ff = feature.faces.item(_fi)
+                _fbb = _ff.boundingBox
+                _ex = (_fbb.minPoint.x + _fbb.maxPoint.x) / 2
+                _ey = (_fbb.minPoint.y + _fbb.maxPoint.y) / 2
+                _ez = (_fbb.minPoint.z + _fbb.maxPoint.z) / 2
+                _dx = _fbb.maxPoint.x - _fbb.minPoint.x
+                _dy = _fbb.maxPoint.y - _fbb.minPoint.y
+                _dz = _fbb.maxPoint.z - _fbb.minPoint.z
+                _max_ext = max(_dx, _dy, _dz)
+                _px, _py, _pz = [], [], []
+                _seen_adj = set()
+                for _ei2 in range(_ff.edges.count):
+                    _edge2 = _ff.edges.item(_ei2)
+                    for _afi in range(_edge2.faces.count):
+                        _af = _edge2.faces.item(_afi)
+                        _atid = _af.tempId
+                        if _atid not in _feature_tids and _atid not in _seen_adj:
+                            _seen_adj.add(_atid)
+                            try:
+                                _ag = _af.geometry
+                                if _ag.objectType.split("::")[-1] == "Plane":
+                                    _an = _ag.normal
+                                    _ao = _ag.origin
+                                    if abs(_an.x) > 0.9 and _dx < _max_ext:
+                                        _px.append(_ao.x)
+                                    elif abs(_an.y) > 0.9 and _dy < _max_ext:
+                                        _py.append(_ao.y)
+                                    elif abs(_an.z) > 0.9 and _dz < _max_ext:
+                                        _pz.append(_ao.z)
+                            except:
+                                pass
+                if _px: _ex = max(_px, key=lambda v: abs(v - _ex))
+                if _py: _ey = max(_py, key=lambda v: abs(v - _ey))
+                if _pz: _ez = max(_pz, key=lambda v: abs(v - _ez))
+                _bbs.append((_ex, _ey, _ez))
+            _parent_comp = feature.parentComponent if feature.parentComponent else rootComp
+            _body_name = None
+            try:
+                if feature.bodies.count > 0:
+                    _body_name = feature.bodies.item(0).name
+            except:
+                pass
+            timeline.markerPosition = ti
+            _body = None
+            for _bi in range(_parent_comp.bRepBodies.count):
+                _b = _parent_comp.bRepBodies.item(_bi)
+                if _body_name and _b.name == _body_name:
+                    _body = _b
+                    break
+            if _body is None and _parent_comp.bRepBodies.count > 0:
+                _body = _parent_comp.bRepBodies.item(0)
+            if _body:
+                _used = set()
+                for (_bcx, _bcy, _bcz) in _bbs:
+                    _best = None
+                    _best_d = 1e9
+                    _best_pt = None
+                    _best_idx = -1
+                    for _ei in range(_body.edges.count):
+                        if _ei in _used:
+                            continue
+                        _e = _body.edges.item(_ei)
+                        try:
+                            _, _sp, _ep = _e.evaluator.getParameterExtents()
+                            _, _mp = _e.evaluator.getPointAtParameter((_sp + _ep) / 2)
+                            _d = ((_mp.x-_bcx)**2 + (_mp.y-_bcy)**2 + (_mp.z-_bcz)**2) ** 0.5
+                            if _d < _best_d:
+                                _best_d = _d
+                                _best = _e
+                                _best_pt = _mp
+                                _best_idx = _ei
+                        except:
+                            continue
+                    if _best and _best_d < 2.0:
+                        _used.add(_best_idx)
+                        _fa = _best.faces.item(0) if _best.faces.count > 0 else None
+                        _fb = _best.faces.item(1) if _best.faces.count > 1 else None
+                        edge_descriptors.append({{
+                            "center": [round(_best_pt.x, 4), round(_best_pt.y, 4), round(_best_pt.z, 4)],
+                            "face_a": _describe_face(_fa) if _fa else None,
+                            "face_b": _describe_face(_fb) if _fb else None,
+                        }})
+            if ti + 1 < tl_count:
+                timeline.markerPosition = ti + 1
+            else:
+                timeline.moveToEnd()
+        except:
+            try:
+                if ti + 1 < tl_count:
+                    timeline.markerPosition = ti + 1
+                else:
+                    timeline.moveToEnd()
+            except:
+                pass
+        return edge_descriptors
+
+    def _extract_feature_faces(feature):
+        """Shared: extract face geometry info from a fillet/chamfer feature."""
+        faces = []
+        for fi in range(feature.faces.count):
+            f = feature.faces.item(fi)
+            bb = f.boundingBox
+            gt = f.geometry.objectType.split("::")[-1] if f.geometry else "unknown"
+            faces.append({{
+                "geom_type": gt,
+                "area": round(f.area, 6),
+                "bb_min": [round(bb.minPoint.x,3), round(bb.minPoint.y,3), round(bb.minPoint.z,3)],
+                "bb_max": [round(bb.maxPoint.x,3), round(bb.maxPoint.y,3), round(bb.maxPoint.z,3)],
+            }})
+        return faces
+
+    def _get_feature_body_name(feature):
+        """Shared: get body name from a feature."""
+        try:
+            if feature.bodies.count > 0:
+                return feature.bodies.item(0).name
+        except:
+            pass
+        return None
+
     for ti in range(tl_count):
         try:
             if ti + 1 < tl_count:
@@ -2069,138 +2198,12 @@ else:
                 edge_sets = []
                 for esi in range(fil.edgeSets.count):
                     es = fil.edgeSets.item(esi)
-                    r = round(es.radius.value, 4)
-                    edge_sets.append({{"radius": r}})
+                    edge_sets.append({{"radius": round(es.radius.value, 4)}})
                 step["edge_sets"] = edge_sets
-                edge_descriptors = []
-                try:
-                    # Compute original edge positions from adjacent face geometry
-                    _fillet_bbs = []
-                    _fillet_tids = set()
-                    for _fi in range(fil.faces.count):
-                        _fillet_tids.add(fil.faces.item(_fi).tempId)
-                    for _fi in range(fil.faces.count):
-                        _ff = fil.faces.item(_fi)
-                        _fbb = _ff.boundingBox
-                        # Default: BB center
-                        _ex = (_fbb.minPoint.x + _fbb.maxPoint.x) / 2
-                        _ey = (_fbb.minPoint.y + _fbb.maxPoint.y) / 2
-                        _ez = (_fbb.minPoint.z + _fbb.maxPoint.z) / 2
-                        # Determine edge direction (largest BB extent) — don't override that axis
-                        _dx = _fbb.maxPoint.x - _fbb.minPoint.x
-                        _dy = _fbb.maxPoint.y - _fbb.minPoint.y
-                        _dz = _fbb.maxPoint.z - _fbb.minPoint.z
-                        _max_ext = max(_dx, _dy, _dz)
-                        # Collect adjacent plane positions per axis
-                        _px, _py, _pz = [], [], []
-                        _seen_adj = set()
-                        for _ei2 in range(_ff.edges.count):
-                            _edge2 = _ff.edges.item(_ei2)
-                            for _afi in range(_edge2.faces.count):
-                                _af = _edge2.faces.item(_afi)
-                                _atid = _af.tempId
-                                if _atid not in _fillet_tids and _atid not in _seen_adj:
-                                    _seen_adj.add(_atid)
-                                    try:
-                                        _ag = _af.geometry
-                                        if _ag.objectType.split("::")[-1] == "Plane":
-                                            _an = _ag.normal
-                                            _ao = _ag.origin
-                                            if abs(_an.x) > 0.9 and _dx < _max_ext:
-                                                _px.append(_ao.x)
-                                            elif abs(_an.y) > 0.9 and _dy < _max_ext:
-                                                _py.append(_ao.y)
-                                            elif abs(_an.z) > 0.9 and _dz < _max_ext:
-                                                _pz.append(_ao.z)
-                                    except:
-                                        pass
-                        # Pick the plane farthest from BB center (at the BB boundary = original edge)
-                        if _px:
-                            _ex = max(_px, key=lambda v: abs(v - _ex))
-                        if _py:
-                            _ey = max(_py, key=lambda v: abs(v - _ey))
-                        if _pz:
-                            _ez = max(_pz, key=lambda v: abs(v - _ez))
-                        _fillet_bbs.append((_ex, _ey, _ez))
-                    _parent_comp = fil.parentComponent if fil.parentComponent else rootComp
-                    _body_name = None
-                    try:
-                        if fil.bodies.count > 0:
-                            _body_name = fil.bodies.item(0).name
-                    except:
-                        pass
-                    # Roll back to BEFORE fillet to capture original edges
-                    timeline.markerPosition = ti
-                    _body = None
-                    for _bi in range(_parent_comp.bRepBodies.count):
-                        _b = _parent_comp.bRepBodies.item(_bi)
-                        if _body_name and _b.name == _body_name:
-                            _body = _b
-                            break
-                    if _body is None and _parent_comp.bRepBodies.count > 0:
-                        _body = _parent_comp.bRepBodies.item(0)
-                    if _body:
-                        _used = set()
-                        for (_bcx, _bcy, _bcz) in _fillet_bbs:
-                            _best = None
-                            _best_d = 1e9
-                            _best_pt = None
-                            _best_idx = -1
-                            for _ei in range(_body.edges.count):
-                                if _ei in _used:
-                                    continue
-                                _e = _body.edges.item(_ei)
-                                try:
-                                    _, _sp, _ep = _e.evaluator.getParameterExtents()
-                                    _, _mp = _e.evaluator.getPointAtParameter((_sp + _ep) / 2)
-                                    _d = ((_mp.x-_bcx)**2 + (_mp.y-_bcy)**2 + (_mp.z-_bcz)**2) ** 0.5
-                                    if _d < _best_d:
-                                        _best_d = _d
-                                        _best = _e
-                                        _best_pt = _mp
-                                        _best_idx = _ei
-                                except:
-                                    continue
-                            if _best and _best_d < 2.0:
-                                _used.add(_best_idx)
-                                _fa = _best.faces.item(0) if _best.faces.count > 0 else None
-                                _fb = _best.faces.item(1) if _best.faces.count > 1 else None
-                                edge_descriptors.append({{
-                                    "center": [round(_best_pt.x, 4), round(_best_pt.y, 4), round(_best_pt.z, 4)],
-                                    "face_a": _describe_face(_fa) if _fa else None,
-                                    "face_b": _describe_face(_fb) if _fb else None,
-                                }})
-                    # Restore timeline position
-                    if ti + 1 < tl_count:
-                        timeline.markerPosition = ti + 1
-                    else:
-                        timeline.moveToEnd()
-                except:
-                    try:
-                        if ti + 1 < tl_count:
-                            timeline.markerPosition = ti + 1
-                        else:
-                            timeline.moveToEnd()
-                    except:
-                        pass
-                step["edge_descriptors"] = edge_descriptors
-                fillet_faces = []
-                for fi in range(fil.faces.count):
-                    f = fil.faces.item(fi)
-                    bb = f.boundingBox
-                    gt = f.geometry.objectType.split("::")[-1] if f.geometry else "unknown"
-                    fillet_faces.append({{
-                        "geom_type": gt,
-                        "area": round(f.area, 6),
-                        "bb_min": [round(bb.minPoint.x,3), round(bb.minPoint.y,3), round(bb.minPoint.z,3)],
-                        "bb_max": [round(bb.maxPoint.x,3), round(bb.maxPoint.y,3), round(bb.maxPoint.z,3)],
-                    }})
-                step["faces"] = fillet_faces
-                try:
-                    if fil.bodies.count > 0:
-                        step["body_name"] = fil.bodies.item(0).name
-                except:
-                    pass
+                step["edge_descriptors"] = _extract_edge_descriptors(fil, timeline, ti, tl_count, rootComp)
+                step["faces"] = _extract_feature_faces(fil)
+                _bn = _get_feature_body_name(fil)
+                if _bn: step["body_name"] = _bn
 
             elif isinstance(entity, adsk.fusion.ChamferFeature):
                 ch = entity
@@ -2209,128 +2212,10 @@ else:
                     es = ch.edgeSets.item(esi)
                     edge_sets.append({{"distance": round(es.distance.value, 4)}})
                 step["edge_sets"] = edge_sets
-                edge_descriptors = []
-                try:
-                    _cham_bbs = []
-                    _cham_tids = set()
-                    for _fi in range(ch.faces.count):
-                        _cham_tids.add(ch.faces.item(_fi).tempId)
-                    for _fi in range(ch.faces.count):
-                        _cf = ch.faces.item(_fi)
-                        _cbb = _cf.boundingBox
-                        _ex = (_cbb.minPoint.x + _cbb.maxPoint.x) / 2
-                        _ey = (_cbb.minPoint.y + _cbb.maxPoint.y) / 2
-                        _ez = (_cbb.minPoint.z + _cbb.maxPoint.z) / 2
-                        _dx = _cbb.maxPoint.x - _cbb.minPoint.x
-                        _dy = _cbb.maxPoint.y - _cbb.minPoint.y
-                        _dz = _cbb.maxPoint.z - _cbb.minPoint.z
-                        _max_ext = max(_dx, _dy, _dz)
-                        _px, _py, _pz = [], [], []
-                        _seen_adj = set()
-                        for _ei2 in range(_cf.edges.count):
-                            _edge2 = _cf.edges.item(_ei2)
-                            for _afi in range(_edge2.faces.count):
-                                _af = _edge2.faces.item(_afi)
-                                _atid = _af.tempId
-                                if _atid not in _cham_tids and _atid not in _seen_adj:
-                                    _seen_adj.add(_atid)
-                                    try:
-                                        _ag = _af.geometry
-                                        if _ag.objectType.split("::")[-1] == "Plane":
-                                            _an = _ag.normal
-                                            _ao = _ag.origin
-                                            if abs(_an.x) > 0.9 and _dx < _max_ext:
-                                                _px.append(_ao.x)
-                                            elif abs(_an.y) > 0.9 and _dy < _max_ext:
-                                                _py.append(_ao.y)
-                                            elif abs(_an.z) > 0.9 and _dz < _max_ext:
-                                                _pz.append(_ao.z)
-                                    except:
-                                        pass
-                        if _px:
-                            _ex = max(_px, key=lambda v: abs(v - _ex))
-                        if _py:
-                            _ey = max(_py, key=lambda v: abs(v - _ey))
-                        if _pz:
-                            _ez = max(_pz, key=lambda v: abs(v - _ez))
-                        _cham_bbs.append((_ex, _ey, _ez))
-                    _parent_comp = ch.parentComponent if ch.parentComponent else rootComp
-                    _body_name = None
-                    try:
-                        if ch.bodies.count > 0:
-                            _body_name = ch.bodies.item(0).name
-                    except:
-                        pass
-                    timeline.markerPosition = ti
-                    _body = None
-                    for _bi in range(_parent_comp.bRepBodies.count):
-                        _b = _parent_comp.bRepBodies.item(_bi)
-                        if _body_name and _b.name == _body_name:
-                            _body = _b
-                            break
-                    if _body is None and _parent_comp.bRepBodies.count > 0:
-                        _body = _parent_comp.bRepBodies.item(0)
-                    if _body:
-                        _used = set()
-                        for (_bcx, _bcy, _bcz) in _cham_bbs:
-                            _best = None
-                            _best_d = 1e9
-                            _best_pt = None
-                            _best_idx = -1
-                            for _ei in range(_body.edges.count):
-                                if _ei in _used:
-                                    continue
-                                _e = _body.edges.item(_ei)
-                                try:
-                                    _, _sp, _ep = _e.evaluator.getParameterExtents()
-                                    _, _mp = _e.evaluator.getPointAtParameter((_sp + _ep) / 2)
-                                    _d = ((_mp.x-_bcx)**2 + (_mp.y-_bcy)**2 + (_mp.z-_bcz)**2) ** 0.5
-                                    if _d < _best_d:
-                                        _best_d = _d
-                                        _best = _e
-                                        _best_pt = _mp
-                                        _best_idx = _ei
-                                except:
-                                    continue
-                            if _best and _best_d < 2.0:
-                                _used.add(_best_idx)
-                                _fa = _best.faces.item(0) if _best.faces.count > 0 else None
-                                _fb = _best.faces.item(1) if _best.faces.count > 1 else None
-                                edge_descriptors.append({{
-                                    "center": [round(_best_pt.x, 4), round(_best_pt.y, 4), round(_best_pt.z, 4)],
-                                    "face_a": _describe_face(_fa) if _fa else None,
-                                    "face_b": _describe_face(_fb) if _fb else None,
-                                }})
-                    if ti + 1 < tl_count:
-                        timeline.markerPosition = ti + 1
-                    else:
-                        timeline.moveToEnd()
-                except:
-                    try:
-                        if ti + 1 < tl_count:
-                            timeline.markerPosition = ti + 1
-                        else:
-                            timeline.moveToEnd()
-                    except:
-                        pass
-                step["edge_descriptors"] = edge_descriptors
-                chamfer_faces = []
-                for fi in range(ch.faces.count):
-                    f = ch.faces.item(fi)
-                    bb = f.boundingBox
-                    gt = f.geometry.objectType.split("::")[-1] if f.geometry else "unknown"
-                    chamfer_faces.append({{
-                        "geom_type": gt,
-                        "area": round(f.area, 6),
-                        "bb_min": [round(bb.minPoint.x,3), round(bb.minPoint.y,3), round(bb.minPoint.z,3)],
-                        "bb_max": [round(bb.maxPoint.x,3), round(bb.maxPoint.y,3), round(bb.maxPoint.z,3)],
-                    }})
-                step["faces"] = chamfer_faces
-                try:
-                    if ch.bodies.count > 0:
-                        step["body_name"] = ch.bodies.item(0).name
-                except:
-                    pass
+                step["edge_descriptors"] = _extract_edge_descriptors(ch, timeline, ti, tl_count, rootComp)
+                step["faces"] = _extract_feature_faces(ch)
+                _bn = _get_feature_body_name(ch)
+                if _bn: step["body_name"] = _bn
 
             elif isinstance(entity, adsk.fusion.RevolveFeature):
                 rev = entity
