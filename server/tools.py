@@ -2435,6 +2435,242 @@ else:
                 except:
                     pass
 
+            elif isinstance(entity, adsk.fusion.ShellFeature):
+                sh = entity
+                try:
+                    step["inside_thickness"] = round(sh.insideThickness.value, 6)
+                except: pass
+                try:
+                    if sh.outsideThickness:
+                        step["outside_thickness"] = round(sh.outsideThickness.value, 6)
+                except: pass
+                step["tangent_chain"] = sh.isTangentChain
+                # Capture faces of the body BEFORE shell to identify removed face(s)
+                # Roll back to before shell, describe all faces, then restore
+                try:
+                    _body_name = sh.bodies.item(0).name if sh.bodies.count > 0 else None
+                    step["body_name"] = _body_name
+                    timeline.markerPosition = ti
+                    _pre_body = None
+                    for _bi in range(rootComp.bRepBodies.count):
+                        if rootComp.bRepBodies.item(_bi).name == _body_name:
+                            _pre_body = rootComp.bRepBodies.item(_bi)
+                            break
+                    if _pre_body is None and rootComp.bRepBodies.count > 0:
+                        _pre_body = rootComp.bRepBodies.item(0)
+                    if _pre_body:
+                        _all_faces = []
+                        for _fi in range(_pre_body.faces.count):
+                            _f = _pre_body.faces.item(_fi)
+                            _g = _f.geometry
+                            _gt = _g.objectType.split("::")[-1]
+                            _bb = _f.boundingBox
+                            _fd = {{"type": _gt, "area": round(_f.area, 4),
+                                   "bb_center": [round((_bb.minPoint.x+_bb.maxPoint.x)/2, 3),
+                                                 round((_bb.minPoint.y+_bb.maxPoint.y)/2, 3),
+                                                 round((_bb.minPoint.z+_bb.maxPoint.z)/2, 3)]}}
+                            if hasattr(_g, 'normal'):
+                                _fd["normal"] = [round(_g.normal.x,3), round(_g.normal.y,3), round(_g.normal.z,3)]
+                            _all_faces.append(_fd)
+                        step["pre_faces"] = _all_faces
+                    # Restore timeline
+                    if ti + 1 < tl_count:
+                        timeline.markerPosition = ti + 1
+                    else:
+                        timeline.moveToEnd()
+                    # Determine removed faces by comparing pre/post face count and areas
+                    _post_body = None
+                    for _bi in range(rootComp.bRepBodies.count):
+                        if rootComp.bRepBodies.item(_bi).name == _body_name:
+                            _post_body = rootComp.bRepBodies.item(_bi)
+                            break
+                    if _post_body:
+                        # For each pre-face, check if a similar face exists in post body
+                        _removed = []
+                        for _fd in _all_faces:
+                            _found = False
+                            for _fi in range(_post_body.faces.count):
+                                _pf = _post_body.faces.item(_fi)
+                                if abs(_pf.area - _fd["area"]) < max(_fd["area"] * 0.05, 0.01):
+                                    _pbb = _pf.boundingBox
+                                    _pc = [(_pbb.minPoint.x+_pbb.maxPoint.x)/2, (_pbb.minPoint.y+_pbb.maxPoint.y)/2, (_pbb.minPoint.z+_pbb.maxPoint.z)/2]
+                                    _dc = _fd["bb_center"]
+                                    if abs(_pc[0]-_dc[0])<0.2 and abs(_pc[1]-_dc[1])<0.2 and abs(_pc[2]-_dc[2])<0.2:
+                                        _found = True
+                                        break
+                            if not _found:
+                                _removed.append(_fd)
+                        step["removed_faces"] = _removed
+                except:
+                    try:
+                        if ti + 1 < tl_count:
+                            timeline.markerPosition = ti + 1
+                        else:
+                            timeline.moveToEnd()
+                    except: pass
+
+            elif isinstance(entity, adsk.fusion.CombineFeature):
+                cb = entity
+                step["operation"] = int(cb.operation)
+                try:
+                    step["target_body"] = cb.targetBody.name
+                except: pass
+                try:
+                    _tool_bodies = []
+                    for _tbi in range(cb.toolBodies.count):
+                        _tool_bodies.append(cb.toolBodies.item(_tbi).name)
+                    step["tool_bodies"] = _tool_bodies
+                except: pass
+                step["is_keep_tools"] = cb.isKeepToolBodies if hasattr(cb, 'isKeepToolBodies') else False
+
+            elif isinstance(entity, adsk.fusion.MirrorFeature):
+                mf = entity
+                try:
+                    mp = mf.mirrorPlane
+                    _mpt = mp.objectType.split("::")[-1]
+                    step["mirror_plane_type"] = _mpt
+                    if _mpt == "ConstructionPlane":
+                        step["mirror_plane_name"] = mp.name
+                    elif _mpt == "BRepFace":
+                        _mg = mp.geometry
+                        if hasattr(_mg, 'normal'):
+                            step["mirror_plane_normal"] = [round(_mg.normal.x,3), round(_mg.normal.y,3), round(_mg.normal.z,3)]
+                        _mbb = mp.boundingBox
+                        step["mirror_plane_center"] = [round((_mbb.minPoint.x+_mbb.maxPoint.x)/2,3), round((_mbb.minPoint.y+_mbb.maxPoint.y)/2,3), round((_mbb.minPoint.z+_mbb.maxPoint.z)/2,3)]
+                except: pass
+                step["operation"] = int(mf.operation) if hasattr(mf, 'operation') else 0
+                try:
+                    if mf.bodies.count > 0:
+                        step["body_name"] = mf.bodies.item(0).name
+                except: pass
+                # Input features/bodies
+                try:
+                    _input_tl = []
+                    for _ii in range(mf.inputEntities.count):
+                        _ie = mf.inputEntities.item(_ii)
+                        if hasattr(_ie, 'timelineObject'):
+                            _input_tl.append(_ie.timelineObject.index)
+                    step["input_timeline_indices"] = _input_tl
+                except: pass
+
+            elif isinstance(entity, adsk.fusion.OffsetFacesFeature):
+                of = entity
+                try:
+                    step["offset_distance"] = round(of.distance.value, 6)
+                except: pass
+                try:
+                    _of_faces = []
+                    for _fi in range(of.faces.count):
+                        _f = of.faces.item(_fi)
+                        _bb = _f.boundingBox
+                        _g = _f.geometry
+                        _fd = {{"bb_center": [round((_bb.minPoint.x+_bb.maxPoint.x)/2,3), round((_bb.minPoint.y+_bb.maxPoint.y)/2,3), round((_bb.minPoint.z+_bb.maxPoint.z)/2,3)],
+                               "area": round(_f.area, 4),
+                               "type": _g.objectType.split("::")[-1] if _g else "unknown"}}
+                        if hasattr(_g, 'normal'):
+                            _fd["normal"] = [round(_g.normal.x,3), round(_g.normal.y,3), round(_g.normal.z,3)]
+                        _of_faces.append(_fd)
+                    step["faces"] = _of_faces
+                except: pass
+                try:
+                    if of.bodies.count > 0:
+                        step["body_name"] = of.bodies.item(0).name
+                except: pass
+
+            elif isinstance(entity, adsk.fusion.SplitBodyFeature):
+                sb = entity
+                try:
+                    _st = sb.splittingTool
+                    step["splitting_tool_type"] = _st.objectType.split("::")[-1]
+                    if hasattr(_st, 'name'):
+                        step["splitting_tool_name"] = _st.name
+                    elif hasattr(_st, 'geometry'):
+                        _sg = _st.geometry
+                        if hasattr(_sg, 'normal'):
+                            step["splitting_tool_normal"] = [round(_sg.normal.x,3), round(_sg.normal.y,3), round(_sg.normal.z,3)]
+                        _sbb = _st.boundingBox
+                        step["splitting_tool_center"] = [round((_sbb.minPoint.x+_sbb.maxPoint.x)/2,3), round((_sbb.minPoint.y+_sbb.maxPoint.y)/2,3), round((_sbb.minPoint.z+_sbb.maxPoint.z)/2,3)]
+                except: pass
+                try:
+                    if sb.bodies.count > 0:
+                        step["body_name"] = sb.bodies.item(0).name
+                except: pass
+
+            elif isinstance(entity, adsk.fusion.DraftFeature):
+                df = entity
+                try:
+                    step["angle"] = round(math.degrees(df.angle.value), 4)
+                except: pass
+                try:
+                    _df_faces = []
+                    for _fi in range(df.inputFaces.count):
+                        _f = df.inputFaces.item(_fi)
+                        _bb = _f.boundingBox
+                        _g = _f.geometry
+                        _fd = {{"bb_center": [round((_bb.minPoint.x+_bb.maxPoint.x)/2,3), round((_bb.minPoint.y+_bb.maxPoint.y)/2,3), round((_bb.minPoint.z+_bb.maxPoint.z)/2,3)],
+                               "area": round(_f.area, 4),
+                               "type": _g.objectType.split("::")[-1] if _g else "unknown"}}
+                        if hasattr(_g, 'normal'):
+                            _fd["normal"] = [round(_g.normal.x,3), round(_g.normal.y,3), round(_g.normal.z,3)]
+                        _of_faces.append(_fd)
+                    step["input_faces"] = _df_faces
+                except: pass
+                try:
+                    _pp = df.pullDirection
+                    if _pp:
+                        step["pull_direction_type"] = _pp.objectType.split("::")[-1]
+                except: pass
+                try:
+                    if df.bodies.count > 0:
+                        step["body_name"] = df.bodies.item(0).name
+                except: pass
+
+            elif isinstance(entity, adsk.fusion.RectangularPatternFeature):
+                rp = entity
+                try:
+                    step["quantity_one"] = int(rp.quantityOne.value) if hasattr(rp.quantityOne, 'value') else int(rp.quantityOne)
+                except: pass
+                try:
+                    step["distance_one"] = round(rp.distanceOne.value, 6)
+                except: pass
+                try:
+                    step["quantity_two"] = int(rp.quantityTwo.value) if hasattr(rp.quantityTwo, 'value') else int(rp.quantityTwo)
+                except: pass
+                try:
+                    step["distance_two"] = round(rp.distanceTwo.value, 6)
+                except: pass
+                try:
+                    ax1 = rp.directionOneEntity
+                    if hasattr(ax1, 'geometry'):
+                        g = ax1.geometry
+                        if hasattr(g, 'direction'):
+                            step["direction_one"] = [round(g.direction.x,4), round(g.direction.y,4), round(g.direction.z,4)]
+                        elif hasattr(g, 'axis'):
+                            step["direction_one"] = [round(g.axis.x,4), round(g.axis.y,4), round(g.axis.z,4)]
+                except: pass
+                try:
+                    ax2 = rp.directionTwoEntity
+                    if ax2 and hasattr(ax2, 'geometry'):
+                        g = ax2.geometry
+                        if hasattr(g, 'direction'):
+                            step["direction_two"] = [round(g.direction.x,4), round(g.direction.y,4), round(g.direction.z,4)]
+                        elif hasattr(g, 'axis'):
+                            step["direction_two"] = [round(g.axis.x,4), round(g.axis.y,4), round(g.axis.z,4)]
+                except: pass
+                # Input features
+                try:
+                    _input_tl = []
+                    for _ii in range(rp.inputEntities.count):
+                        _ie = rp.inputEntities.item(_ii)
+                        if hasattr(_ie, 'timelineObject'):
+                            _input_tl.append(_ie.timelineObject.index)
+                    step["input_timeline_indices"] = _input_tl
+                except: pass
+                try:
+                    if rp.bodies.count > 0:
+                        step["body_name"] = rp.bodies.item(0).name
+                except: pass
+
             elif isinstance(entity, adsk.fusion.ConstructionPlane):
                 cp = entity
                 defn = cp.definition

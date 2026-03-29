@@ -1009,6 +1009,204 @@ def _generate_step_body(step, context, all_steps, lines, I2, comp_var):
         else:
             lines.append(f'{I2}print("Step {idx}: {sname} SKIPPED - no features to pattern")')
 
+    elif stype == 'ShellFeature':
+        thickness = step.get('inside_thickness', 0.2)
+        removed = step.get('removed_faces', [])
+        if removed:
+            # Find the face to remove by geometry descriptor
+            rd = removed[0]  # Usually one face removed
+            lines.append(f"{I2}_shell_face = None")
+            lines.append(f"{I2}_shell_score = 1e9")
+            lines.append(f"{I2}for _bi in range({comp_var}.bRepBodies.count):")
+            lines.append(f"{I2}    _b = {comp_var}.bRepBodies.item(_bi)")
+            lines.append(f"{I2}    for _fi in range(_b.faces.count):")
+            lines.append(f"{I2}        _f = _b.faces.item(_fi)")
+            lines.append(f"{I2}        try:")
+            lines.append(f"{I2}            _g = _f.geometry")
+            if 'normal' in rd:
+                n = rd['normal']
+                lines.append(f"{I2}            if hasattr(_g, 'normal') and abs(_g.normal.x-({n[0]}))<0.15 and abs(_g.normal.y-({n[1]}))<0.15 and abs(_g.normal.z-({n[2]}))<0.15:")
+            else:
+                lines.append(f"{I2}            if True:")
+            lines.append(f"{I2}                _ad = abs(_f.area - {rd['area']})")
+            lines.append(f"{I2}                if _ad < _shell_score:")
+            lines.append(f"{I2}                    _shell_face = _f")
+            lines.append(f"{I2}                    _shell_score = _ad")
+            lines.append(f"{I2}        except: pass")
+            lines.append(f"{I2}if _shell_face:")
+            lines.append(f"{I2}    _sc = adsk.core.ObjectCollection.create()")
+            lines.append(f"{I2}    _sc.add(_shell_face)")
+            lines.append(f"{I2}    _si = {comp_var}.features.shellFeatures.createInput(_sc, False)")
+            lines.append(f"{I2}    _si.insideThickness = VI({thickness})")
+            lines.append(f"{I2}    {comp_var}.features.shellFeatures.add(_si)")
+            lines.append(f'{I2}    print("Step {idx}: {sname} t={round(thickness*10,1)}mm")')
+            lines.append(f"{I2}else:")
+            lines.append(f'{I2}    print("Step {idx}: {sname} FAILED - face not found")')
+        else:
+            lines.append(f'{I2}print("Step {idx}: {sname} SKIPPED - no face data")')
+
+    elif stype == 'CombineFeature':
+        op = step.get('operation', 0)
+        target = step.get('target_body', '')
+        tools = step.get('tool_bodies', [])
+        keep = step.get('is_keep_tools', False)
+        if target and tools:
+            lines.append(f"{I2}_target = get_body({comp_var}, '{target}')")
+            lines.append(f"{I2}_tools = adsk.core.ObjectCollection.create()")
+            for tb in tools:
+                lines.append(f"{I2}_tb = get_body({comp_var}, '{tb}')")
+                lines.append(f"{I2}if _tb: _tools.add(_tb)")
+            lines.append(f"{I2}if _target and _tools.count > 0:")
+            lines.append(f"{I2}    _ci = {comp_var}.features.combineFeatures.createInput(_target, _tools)")
+            lines.append(f"{I2}    _ci.operation = _OP[{op}]")
+            lines.append(f"{I2}    _ci.isKeepToolBodies = {keep}")
+            lines.append(f"{I2}    {comp_var}.features.combineFeatures.add(_ci)")
+            lines.append(f'{I2}    print("Step {idx}: {sname}")')
+            lines.append(f"{I2}else:")
+            lines.append(f'{I2}    print("Step {idx}: {sname} FAILED - bodies not found")')
+        else:
+            lines.append(f'{I2}print("Step {idx}: {sname} SKIPPED - no data")')
+
+    elif stype == 'MirrorFeature':
+        op = step.get('operation', 0)
+        plane_type = step.get('mirror_plane_type', '')
+        plane_name = step.get('mirror_plane_name', '')
+        plane_normal = step.get('mirror_plane_normal')
+        input_indices = step.get('input_timeline_indices', [])
+        # Determine mirror plane
+        if plane_name in ('XY', 'XZ', 'YZ') or plane_type == 'ConstructionPlane':
+            if 'XY' in plane_name or 'XY' in str(step):
+                plane_expr = f"{comp_var}.xYConstructionPlane"
+            elif 'XZ' in plane_name or (plane_normal and abs(plane_normal[1]) > 0.9):
+                plane_expr = f"{comp_var}.xZConstructionPlane"
+            elif 'YZ' in plane_name or (plane_normal and abs(plane_normal[0]) > 0.9):
+                plane_expr = f"{comp_var}.yZConstructionPlane"
+            else:
+                # Custom construction plane — look up by name
+                plane_expr = None
+                for pidx, pvar in context.plane_vars.items():
+                    pstep = all_steps[pidx] if pidx < len(all_steps) else {}
+                    if pstep.get('name', '') == plane_name:
+                        plane_expr = f"plane_{pidx}"
+                        break
+                if not plane_expr:
+                    plane_expr = f"{comp_var}.xYConstructionPlane"
+        elif plane_normal:
+            if abs(plane_normal[0]) > 0.9:
+                plane_expr = f"{comp_var}.yZConstructionPlane"
+            elif abs(plane_normal[1]) > 0.9:
+                plane_expr = f"{comp_var}.xZConstructionPlane"
+            else:
+                plane_expr = f"{comp_var}.xYConstructionPlane"
+        else:
+            plane_expr = f"{comp_var}.xYConstructionPlane"
+
+        # Collect input features
+        prev_feats = [context.feature_vars[fi] for fi in input_indices if fi in context.feature_vars]
+        if not prev_feats:
+            # Fallback: use most recent feature
+            all_fi = sorted(fi for fi in context.feature_vars if fi < idx)
+            if all_fi:
+                prev_feats = [context.feature_vars[all_fi[-1]]]
+
+        if prev_feats:
+            lines.append(f"{I2}_mc = adsk.core.ObjectCollection.create()")
+            for fv in prev_feats:
+                lines.append(f"{I2}if {fv}: _mc.add({fv})")
+            lines.append(f"{I2}if _mc.count > 0:")
+            lines.append(f"{I2}    _mi = {comp_var}.features.mirrorFeatures.createInput(_mc, {plane_expr})")
+            op_names = {0:'JoinFeatureOperation', 1:'CutFeatureOperation', 3:'NewBodyFeatureOperation'}
+            op_name = op_names.get(op, 'JoinFeatureOperation')
+            lines.append(f"{I2}    _mi.operation = adsk.fusion.FeatureOperations.{op_name}")
+            lines.append(f"{I2}    {comp_var}.features.mirrorFeatures.add(_mi)")
+            lines.append(f'{I2}    print("Step {idx}: {sname}")')
+            lines.append(f"{I2}else:")
+            lines.append(f'{I2}    print("Step {idx}: {sname} SKIPPED - no features")')
+        else:
+            lines.append(f'{I2}print("Step {idx}: {sname} SKIPPED - no input features")')
+
+    elif stype == 'OffsetFacesFeature':
+        dist = step.get('offset_distance', 0)
+        faces_data = step.get('faces', [])
+        if faces_data and dist != 0:
+            lines.append(f"{I2}_of_faces = adsk.core.ObjectCollection.create()")
+            for fd in faces_data:
+                bc = fd.get('bb_center', [0,0,0])
+                n = fd.get('normal')
+                lines.append(f"{I2}for _bi in range({comp_var}.bRepBodies.count):")
+                lines.append(f"{I2}    for _fi in range({comp_var}.bRepBodies.item(_bi).faces.count):")
+                lines.append(f"{I2}        _f = {comp_var}.bRepBodies.item(_bi).faces.item(_fi)")
+                lines.append(f"{I2}        _bb = _f.boundingBox")
+                lines.append(f"{I2}        _cx = (_bb.minPoint.x+_bb.maxPoint.x)/2")
+                lines.append(f"{I2}        _cy = (_bb.minPoint.y+_bb.maxPoint.y)/2")
+                lines.append(f"{I2}        _cz = (_bb.minPoint.z+_bb.maxPoint.z)/2")
+                if n:
+                    lines.append(f"{I2}        _g = _f.geometry")
+                    lines.append(f"{I2}        if hasattr(_g,'normal') and abs(_g.normal.x-({n[0]}))<0.15 and abs(_g.normal.y-({n[1]}))<0.15 and abs(_g.normal.z-({n[2]}))<0.15:")
+                    lines.append(f"{I2}            if abs(_cx-({bc[0]}))<0.1 and abs(_cy-({bc[1]}))<0.1 and abs(_cz-({bc[2]}))<0.1:")
+                    lines.append(f"{I2}                _of_faces.add(_f)")
+                else:
+                    lines.append(f"{I2}        if abs(_cx-({bc[0]}))<0.1 and abs(_cy-({bc[1]}))<0.1 and abs(_cz-({bc[2]}))<0.1:")
+                    lines.append(f"{I2}            if abs(_f.area - {fd.get('area',0)}) < 0.1:")
+                    lines.append(f"{I2}                _of_faces.add(_f)")
+            lines.append(f"{I2}if _of_faces.count > 0:")
+            lines.append(f"{I2}    _oi = {comp_var}.features.offsetFacesFeatures.createInput(_of_faces, VI({dist}))")
+            lines.append(f"{I2}    {comp_var}.features.offsetFacesFeatures.add(_oi)")
+            lines.append(f'{I2}    print(f"Step {idx}: {sname} {{_of_faces.count}} faces")')
+            lines.append(f"{I2}else:")
+            lines.append(f'{I2}    print("Step {idx}: {sname} FAILED - faces not found")')
+        else:
+            lines.append(f'{I2}print("Step {idx}: {sname} SKIPPED - no data")')
+
+    elif stype == 'SplitBodyFeature':
+        lines.append(f'{I2}print("Step {idx}: {sname} (SplitBodyFeature) SKIPPED - not yet implemented")')
+
+    elif stype == 'DraftFeature':
+        lines.append(f'{I2}print("Step {idx}: {sname} (DraftFeature) SKIPPED - not yet implemented")')
+
+    elif stype == 'RectangularPatternFeature':
+        qty1 = step.get('quantity_one', 2)
+        dist1 = step.get('distance_one', 1.0)
+        dir1 = step.get('direction_one')
+        input_indices = step.get('input_timeline_indices', [])
+        if input_indices:
+            prev_feats = [context.feature_vars[fi] for fi in input_indices if fi in context.feature_vars]
+        else:
+            all_fi = sorted(fi for fi in context.feature_vars if fi < idx)
+            prev_feats = [context.feature_vars[all_fi[-1]]] if all_fi else []
+
+        if prev_feats and dir1:
+            if abs(dir1[0]) > 0.9:
+                axis_expr = f"{comp_var}.xConstructionAxis"
+            elif abs(dir1[1]) > 0.9:
+                axis_expr = f"{comp_var}.yConstructionAxis"
+            else:
+                axis_expr = f"{comp_var}.zConstructionAxis"
+            lines.append(f"{I2}_pc = adsk.core.ObjectCollection.create()")
+            for fv in prev_feats:
+                lines.append(f"{I2}if {fv}: _pc.add({fv})")
+            lines.append(f"{I2}if _pc.count > 0:")
+            lines.append(f"{I2}    _rpi = {comp_var}.features.rectangularPatternFeatures.createInput(_pc, {axis_expr})")
+            lines.append(f"{I2}    _rpi.quantityOne = VI({qty1})")
+            lines.append(f"{I2}    _rpi.distanceOne = VI({dist1})")
+            qty2 = step.get('quantity_two')
+            if qty2 and qty2 > 1:
+                dir2 = step.get('direction_two')
+                if dir2:
+                    if abs(dir2[0]) > 0.9:
+                        axis2 = f"{comp_var}.xConstructionAxis"
+                    elif abs(dir2[1]) > 0.9:
+                        axis2 = f"{comp_var}.yConstructionAxis"
+                    else:
+                        axis2 = f"{comp_var}.zConstructionAxis"
+                    lines.append(f"{I2}    _rpi.setDirectionTwo({axis2}, VI({qty2}), VI({step.get('distance_two', 1.0)}))")
+            lines.append(f"{I2}    {comp_var}.features.rectangularPatternFeatures.add(_rpi)")
+            lines.append(f'{I2}    print("Step {idx}: {sname} x{qty1}")')
+            lines.append(f"{I2}else:")
+            lines.append(f'{I2}    print("Step {idx}: {sname} SKIPPED - no features")')
+        else:
+            lines.append(f'{I2}print("Step {idx}: {sname} SKIPPED - no data")')
+
     else:
         lines.append(f'{I2}print("Step {idx}: {sname} ({stype}) SKIPPED")')
 

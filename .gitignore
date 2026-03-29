@@ -12,3 +12,4 @@ exchange/renders/*.png
 
 # OS
 .DS_Store
+pending/
