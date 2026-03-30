@@ -3,7 +3,7 @@ Fusion 360 MCP Server — minimal dispatcher.
 
 Stable core: file-based communication with FusionMCPBridge add-in,
 MCP protocol handling. All tool logic is in hot-reloadable modules
-(tools.py, generator.py, etc.) — edits take effect without restart.
+(tools.py) — edits take effect without restart.
 """
 
 import asyncio
