@@ -633,6 +633,89 @@ def _generate_edge_feature_code(step, lines, I2, comp_var, body_name, idx, sname
     lines.append(f'{I2}    print("Step {idx}: {sname} SKIPPED - no edges found")')
 
 
+def _generate_params_code(params: list[dict]) -> str:
+    """Generate code to create user parameters in the reconstruction design."""
+    if not params:
+        return ''
+    lines = ['# ── User Parameters ──', 'try:']
+    # Topological sort: params must be created after their dependencies
+    param_names = {p['name'] for p in params}
+    import re
+    def _get_deps(p):
+        expr = p.get('expression', '')
+        return {n for n in param_names if n != p['name'] and re.search(r'\b' + re.escape(n) + r'\b', expr)}
+    ordered = []
+    remaining = list(params)
+    created = set()
+    for _ in range(len(params) + 1):
+        if not remaining:
+            break
+        progress = False
+        still_remaining = []
+        for p in remaining:
+            deps = _get_deps(p)
+            if deps <= created:
+                ordered.append(p)
+                created.add(p['name'])
+                progress = True
+            else:
+                still_remaining.append(p)
+        remaining = still_remaining
+        if not progress:
+            ordered.extend(remaining)  # break cycles
+            break
+    for p in ordered:
+        name = p['name']
+        expr = p['expression']
+        unit = p.get('unit', 'mm')
+        # Use expression directly — Fusion resolves it
+        lines.append(f'    design.userParameters.add("{name}", '
+                     f'adsk.core.ValueInput.createByString("{expr}"), "{unit}", "")')
+    lines.append(f'    print("Created {len(params)} user parameters")')
+    lines.append('except Exception as _e:')
+    lines.append('    print(f"User parameters: {_e}")')
+    lines.append('')
+    return '\n'.join(lines)
+
+
+def _append_expr_code(lines: list, var: str, step: dict, stype: str, I2: str):
+    """Append expression-setting code after a feature creation."""
+    exprs = []
+    if stype == 'ExtrudeFeature':
+        e = step.get('distance_expr')
+        if e:
+            exprs.append(f"{I2}        {var}.extentOne.distance.expression = \"{e}\"")
+    elif stype in ('FilletFeature', 'ChamferFeature'):
+        edge_sets = step.get('edge_sets', [])
+        if edge_sets:
+            if stype == 'FilletFeature':
+                e = edge_sets[0].get('radius_expr')
+                if e:
+                    exprs.append(f"{I2}        {var}.edgeSets.item(0).radius.expression = \"{e}\"")
+            else:
+                e = edge_sets[0].get('distance_expr')
+                if e:
+                    exprs.append(f"{I2}        {var}.edgeSets.item(0).distance.expression = \"{e}\"")
+    elif stype == 'ConstructionPlane':
+        e = step.get('offset_expr')
+        if e:
+            exprs.append(f"{I2}        {var}.definition.offset.expression = \"{e}\"")
+    elif stype == 'RevolveFeature':
+        e = step.get('angle_expr')
+        if e:
+            exprs.append(f"{I2}        {var}.extentDefinition.angle.expression = \"{e}\"")
+    elif stype == 'ShellFeature':
+        e = step.get('inside_thickness_expr')
+        if e:
+            exprs.append(f"{I2}        {var}.insideThickness.expression = \"{e}\"")
+
+    if exprs:
+        lines.append(f"{I2}if {var}:")
+        lines.append(f"{I2}    try:")
+        lines.extend(exprs)
+        lines.append(f"{I2}    except: pass")
+
+
 def _generate_step_body(step, context, all_steps, lines, I2, comp_var):
     """Generate the body of a single step (shared between single-step and full-script modes)."""
     idx = step['index']
@@ -861,6 +944,8 @@ def _generate_step_body(step, context, all_steps, lines, I2, comp_var):
         else:
             lines.append(f'{I2}print("Step {idx}: {sname} SKIPPED - no profiles")')
 
+        _append_expr_code(lines, var, step, stype, I2)
+
     elif stype == 'ConstructionPlane':
         var = f"plane_{idx}"
         context.plane_vars[idx] = var
@@ -878,6 +963,8 @@ def _generate_step_body(step, context, all_steps, lines, I2, comp_var):
         lines.append(f"{I2}{var} = {comp_var}.constructionPlanes.add(_pi)")
         lines.append(f'{I2}{var}.name = "{sname}"')
         lines.append(f'{I2}print("Step {idx}: {sname} z={round(abs_z*10,1)}mm")')
+
+        _append_expr_code(lines, var, step, stype, I2)
 
     elif stype == 'Occurrence':
         cname = step.get('component_name', 'component')
@@ -954,6 +1041,8 @@ def _generate_step_body(step, context, all_steps, lines, I2, comp_var):
                 lines.append(f'{I2}    print("Step {idx}: {sname} FAILED - all axes")')
         else:
             lines.append(f'{I2}print("Step {idx}: {sname} SKIPPED - no sketch")')
+
+        _append_expr_code(lines, var, step, stype, I2)
 
     elif stype == 'CircularPatternFeature':
         qty = step.get('quantity', 2)
@@ -1219,6 +1308,7 @@ def _generate_reconstruction_script(data: dict) -> str:
     """Generate a full Fusion 360 Python reconstruction script by calling
     generate_single_step for each timeline step. Single source of truth."""
     timeline = data.get('timeline', [])
+    params = data.get('parameters', [])
     ctx = ReconstructionContext()
 
     full_code = None
@@ -1226,6 +1316,13 @@ def _generate_reconstruction_script(data: dict) -> str:
         code = generate_single_step(step, ctx, timeline)
         if i == 0:
             full_code = code
+            # Insert user parameter creation between helpers and first step
+            if params:
+                param_code = _generate_params_code(params)
+                marker = '# ── Step'
+                pos = full_code.find(marker)
+                if pos > 0:
+                    full_code = full_code[:pos] + param_code + '\n' + full_code[pos:]
         else:
             # Extract just the step block (after helpers)
             lines = code.split('\n')

@@ -1,0 +1,35 @@
+{
+  "step_index": 2,
+  "body_count": 1,
+  "bodies": [
+    {
+      "name": "case",
+      "volume": 28.152292,
+      "area": 146.473247,
+      "bbox_min": [
+        -2.61,
+        -2.61,
+        0.0
+      ],
+      "bbox_max": [
+        2.61,
+        2.61,
+        2.4
+      ],
+      "faces": 14,
+      "edges": 32
+    }
+  ],
+  "sketch_count": 1,
+  "sketches": [
+    {
+      "name": "deviceShape",
+      "profiles": 7,
+      "curves": 10
+    }
+  ],
+  "total_volume": 28.152292,
+  "total_area": 146.473247,
+  "total_faces": 14,
+  "total_edges": 32
+}

@@ -1,0 +1,62 @@
+{
+  "step_index": 11,
+  "body_count": 2,
+  "bodies": [
+    {
+      "name": "case",
+      "volume": 16.804157,
+      "area": 118.178181,
+      "bbox_min": [
+        -2.61,
+        -2.61,
+        0.0
+      ],
+      "bbox_max": [
+        2.61,
+        2.61,
+        2.4
+      ],
+      "faces": 18,
+      "edges": 47
+    },
+    {
+      "name": "cylinder",
+      "volume": 9.274174,
+      "area": 38.52998,
+      "bbox_min": [
+        -1.3,
+        -1.3,
+        0.37
+      ],
+      "bbox_max": [
+        1.3,
+        1.3,
+        2.4
+      ],
+      "faces": 11,
+      "edges": 21
+    }
+  ],
+  "sketch_count": 3,
+  "sketches": [
+    {
+      "name": "deviceShape",
+      "profiles": 7,
+      "curves": 10
+    },
+    {
+      "name": "cylinderTop",
+      "profiles": 2,
+      "curves": 2
+    },
+    {
+      "name": "cylinderBottom",
+      "profiles": 4,
+      "curves": 9
+    }
+  ],
+  "total_volume": 26.078331,
+  "total_area": 156.708161,
+  "total_faces": 29,
+  "total_edges": 68
+}

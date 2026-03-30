@@ -1683,6 +1683,16 @@ async def _handle_reconstruct_step(arguments, send_to_fusion, read_image_as_base
     # Generate code for this step
     code = generator.generate_single_step(step, ctx, timeline)
 
+    # For step 0, prepend user parameter creation
+    if step_index == 0:
+        params = export_data.get('parameters', [])
+        if params:
+            param_code = generator._generate_params_code(params)
+            marker = '# ── Step'
+            pos = code.find(marker)
+            if pos > 0:
+                code = code[:pos] + param_code + '\n' + code[pos:]
+
     # Execute in Fusion (no render — verify_step will render on FAIL if needed)
     result = await send_to_fusion(code, render=False, timeout=60)
 
@@ -2192,8 +2202,14 @@ else:
                 step["extent_type"] = e1.objectType.split("::")[-1]
                 if hasattr(e1, 'distance'):
                     step["distance"] = round(e1.distance.value, 4)
+                    try:
+                        step["distance_expr"] = e1.distance.expression
+                    except: pass
                 if ext.extentTwo and hasattr(ext.extentTwo, 'distance'):
                     step["distance2"] = round(ext.extentTwo.distance.value, 4)
+                    try:
+                        step["distance2_expr"] = ext.extentTwo.distance.expression
+                    except: pass
                 step["is_symmetric"] = hasattr(ext, 'isSymmetricExtent') and ext.isSymmetricExtent
                 try:
                     _sk = ext.profile if not hasattr(ext.profile, 'count') else ext.profile.item(0)
@@ -2283,7 +2299,11 @@ else:
                 edge_sets = []
                 for esi in range(fil.edgeSets.count):
                     es = fil.edgeSets.item(esi)
-                    edge_sets.append({{"radius": round(es.radius.value, 4)}})
+                    _es_data = {{"radius": round(es.radius.value, 4)}}
+                    try:
+                        _es_data["radius_expr"] = es.radius.expression
+                    except: pass
+                    edge_sets.append(_es_data)
                 step["edge_sets"] = edge_sets
                 step["edge_descriptors"] = _extract_edge_descriptors(fil, timeline, ti, tl_count, rootComp)
                 step["faces"] = _extract_feature_faces(fil)
@@ -2295,7 +2315,11 @@ else:
                 edge_sets = []
                 for esi in range(ch.edgeSets.count):
                     es = ch.edgeSets.item(esi)
-                    edge_sets.append({{"distance": round(es.distance.value, 4)}})
+                    _es_data = {{"distance": round(es.distance.value, 4)}}
+                    try:
+                        _es_data["distance_expr"] = es.distance.expression
+                    except: pass
+                    edge_sets.append(_es_data)
                 step["edge_sets"] = edge_sets
                 step["edge_descriptors"] = _extract_edge_descriptors(ch, timeline, ti, tl_count, rootComp)
                 step["faces"] = _extract_feature_faces(ch)
@@ -2307,6 +2331,9 @@ else:
                 step["operation"] = int(rev.operation)
                 try:
                     step["angle"] = round(math.degrees(rev.extentDefinition.angle.value), 1)
+                    try:
+                        step["angle_expr"] = rev.extentDefinition.angle.expression
+                    except: pass
                 except:
                     step["angle"] = 360.0
                 try:
@@ -2390,10 +2417,16 @@ else:
                 cp = entity
                 try:
                     step["quantity"] = int(cp.quantity.value) if hasattr(cp.quantity, 'value') else int(cp.quantity)
+                    try:
+                        step["quantity_expr"] = cp.quantity.expression if hasattr(cp.quantity, 'expression') else None
+                    except: pass
                 except:
                     pass
                 try:
                     step["total_angle"] = round(math.degrees(cp.totalAngle.value), 1)
+                    try:
+                        step["total_angle_expr"] = cp.totalAngle.expression
+                    except: pass
                 except:
                     step["total_angle"] = 360.0
                 try:
@@ -2439,6 +2472,9 @@ else:
                 sh = entity
                 try:
                     step["inside_thickness"] = round(sh.insideThickness.value, 6)
+                    try:
+                        step["inside_thickness_expr"] = sh.insideThickness.expression
+                    except: pass
                 except: pass
                 try:
                     if sh.outsideThickness:
@@ -2557,6 +2593,9 @@ else:
                 of = entity
                 try:
                     step["offset_distance"] = round(of.distance.value, 6)
+                    try:
+                        step["offset_distance_expr"] = of.distance.expression
+                    except: pass
                 except: pass
                 try:
                     _of_faces = []
@@ -2677,6 +2716,9 @@ else:
                 step["defn_type"] = defn.objectType.split("::")[-1] if defn else "unknown"
                 if hasattr(defn, 'offset'):
                     step["offset"] = round(defn.offset.value, 4)
+                    try:
+                        step["offset_expr"] = defn.offset.expression
+                    except: pass
                 try:
                     _cpg = cp.geometry
                     step["geometry_origin"] = [round(_cpg.origin.x,4), round(_cpg.origin.y,4), round(_cpg.origin.z,4)]

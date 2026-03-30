@@ -1,0 +1,94 @@
+{
+  "step_index": 37,
+  "body_count": 3,
+  "bodies": [
+    {
+      "name": "case",
+      "volume": 16.581075,
+      "area": 119.408663,
+      "bbox_min": [
+        -2.61,
+        -2.61,
+        0.0
+      ],
+      "bbox_max": [
+        2.61,
+        2.61,
+        2.4
+      ],
+      "faces": 61,
+      "edges": 159
+    },
+    {
+      "name": "cylinder",
+      "volume": 10.171313,
+      "area": 44.000278,
+      "bbox_min": [
+        -1.3,
+        -1.3,
+        0.37
+      ],
+      "bbox_max": [
+        1.3,
+        1.3,
+        3.3
+      ],
+      "faces": 33,
+      "edges": 69
+    },
+    {
+      "name": "lid/lid",
+      "volume": 8.537378,
+      "area": 54.176744,
+      "bbox_min": [
+        -2.61,
+        -2.61,
+        -0.13
+      ],
+      "bbox_max": [
+        2.61,
+        2.61,
+        0.85
+      ],
+      "faces": 22,
+      "edges": 46
+    }
+  ],
+  "sketch_count": 6,
+  "sketches": [
+    {
+      "name": "deviceShape",
+      "profiles": 7,
+      "curves": 10
+    },
+    {
+      "name": "cylinderTop",
+      "profiles": 2,
+      "curves": 2
+    },
+    {
+      "name": "cylinderBottom",
+      "profiles": 4,
+      "curves": 9
+    },
+    {
+      "name": "capTeeth",
+      "profiles": 3,
+      "curves": 18
+    },
+    {
+      "name": "handle",
+      "profiles": 3,
+      "curves": 7
+    },
+    {
+      "name": "label",
+      "profiles": 7,
+      "curves": 21
+    }
+  ],
+  "total_volume": 35.289766,
+  "total_area": 217.585685,
+  "total_faces": 116,
+  "total_edges": 274
+}
